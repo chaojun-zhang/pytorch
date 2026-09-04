@@ -167,6 +167,19 @@ class DeviceInterface:
         """
         return None
 
+    @classmethod
+    def get_repro_system_info(cls) -> str | None:
+        """Return the system-info comment block embedded in generated repros.
+
+        The return value is spliced verbatim into generated Python source
+        (each line must start with ``#``); any truthy value is used after
+        ``str()``. Returning a falsy value falls back to the generic collector
+        in ``torch._dynamo.debug_utils.device_system_info_comment()``. The
+        ``cuda`` device type never reaches this hook: repros keep using the
+        cached ``_cuda_system_info_comment`` for nvcc / ROCm specifics.
+        """
+        return None
+
     @staticmethod
     def get_compute_capability(device: torch.types.Device = None) -> Any:
         raise NotImplementedError
