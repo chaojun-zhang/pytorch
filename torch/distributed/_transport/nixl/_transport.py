@@ -27,6 +27,10 @@ if TYPE_CHECKING:
     from .._api import Memory
 
 
+# Device memory NIXL registers as VRAM: CUDA (also ROCm) and Intel XPU (Level Zero).
+_DEVICE_TYPES = ("cpu", "cuda", "xpu")
+
+
 def _load_backend() -> Any:
     try:
         return import_module("nixl")
@@ -63,8 +67,8 @@ class NIXLTransport(Transport):
         timeout: float = 30.0,
     ) -> None:
         super().__init__(device)
-        if self.device is not None and self.device.type not in ("cpu", "cuda"):
-            raise ValueError("NIXL transport requires a CPU or CUDA device")
+        if self.device is not None and self.device.type not in _DEVICE_TYPES:
+            raise ValueError("NIXL transport requires a CPU, CUDA or XPU device")
         if not plugin:
             raise ValueError("plugin cannot be empty")
         if num_threads < 0:
@@ -183,8 +187,8 @@ class NIXLTransport(Transport):
         if tensor.numel() == 0:
             raise ValueError("cannot register an empty tensor")
         self._check_device(tensor.device)
-        if tensor.device.type not in ("cpu", "cuda"):
-            raise ValueError("NIXL transport requires CPU or CUDA tensors")
+        if tensor.device.type not in _DEVICE_TYPES:
+            raise ValueError("NIXL transport requires CPU, CUDA or XPU tensors")
         length = tensor.numel() * tensor.element_size()
         key = tensor.data_ptr(), length, str(tensor.device)
         if registration := self._registrations.get(key):
@@ -197,7 +201,7 @@ class NIXLTransport(Transport):
             tensor.data_ptr(),
             length,
             max(tensor.get_device(), 0),
-            "VRAM" if tensor.is_cuda else "DRAM",
+            "DRAM" if tensor.device.type == "cpu" else "VRAM",
         )
         self._registrations[key] = registration
         _live_transports.add(self)
