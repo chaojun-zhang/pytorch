@@ -1384,7 +1384,9 @@ class TestRocmDlinkArgs(common.TestCase):
             ["--amdgpu-target=gfx90a"],
         )
         self.assertEqual(
-            _get_rocm_dlink_arch_flags(["--offload-arch", "gfx942", "-O2", "-fgpu-rdc"]),
+            _get_rocm_dlink_arch_flags(
+                ["--offload-arch", "gfx942", "-O2", "-fgpu-rdc"]
+            ),
             ["--offload-arch", "gfx942"],
         )
         self.assertEqual(
@@ -1405,7 +1407,9 @@ class TestRocmDlinkArgs(common.TestCase):
             mock.patch.object(torch.utils.cpp_extension, "IS_WINDOWS", True),
             mock.patch.object(torch.utils.cpp_extension, "ROCM_HOME", None),
         ):
-            with self.assertRaisesRegex(RuntimeError, "not supported for ROCm extensions on Windows"):
+            with self.assertRaisesRegex(
+                RuntimeError, "not supported for ROCm extensions on Windows"
+            ):
                 torch.utils.cpp_extension.CUDAExtension("x", ["x.cpp"], dlink=True)
 
     def _rocm_cuda_extension(self, **kwargs):
@@ -1413,8 +1417,12 @@ class TestRocmDlinkArgs(common.TestCase):
         with (
             mock.patch.object(torch.utils.cpp_extension, "IS_HIP_EXTENSION", True),
             mock.patch.object(torch.utils.cpp_extension, "IS_WINDOWS", False),
-            mock.patch.object(torch.utils.cpp_extension, "library_paths", return_value=[]),
-            mock.patch.object(torch.utils.cpp_extension, "include_paths", return_value=[]),
+            mock.patch.object(
+                torch.utils.cpp_extension, "library_paths", return_value=[]
+            ),
+            mock.patch.object(
+                torch.utils.cpp_extension, "include_paths", return_value=[]
+            ),
             mock.patch("torch.utils.hipify.hipify_python.hipify", return_value={}),
             mock.patch.dict(os.environ, {"PYTORCH_ROCM_ARCH": "gfx942"}),
         ):
@@ -1441,7 +1449,9 @@ class TestRocmDlinkArgs(common.TestCase):
 
     def test_dlink_list_compile_args(self):
         ext = self._rocm_cuda_extension(dlink=True, extra_compile_args=["-g"])
-        self.assertEqual(ext.extra_compile_args, {"cxx": ["-g"], "nvcc": ["-g", "-fgpu-rdc"]})
+        self.assertEqual(
+            ext.extra_compile_args, {"cxx": ["-g"], "nvcc": ["-g", "-fgpu-rdc"]}
+        )
 
     def test_dlink_libraries_alone(self):
         ext = self._rocm_cuda_extension(dlink_libraries=["dlink_lib"])
@@ -1478,10 +1488,15 @@ class TestRocmDlinkArgs(common.TestCase):
             torch.utils.cpp_extension._wrap_hip_dlink_link(compiler)
             self.assertIs(compiler.link, wrapped_link)  # a second call must not stack
             with tempfile.TemporaryDirectory() as d:
-                for name, post in (("dlink", ["-fgpu-rdc", "--hip-link"]), ("plain", [])):
+                for name, post in (
+                    ("dlink", ["-fgpu-rdc", "--hip-link"]),
+                    ("plain", []),
+                ):
                     compiler.link_shared_object(
-                        ["a.o"], os.path.join(d, f"{name}.so"),
-                        extra_postargs=post, target_lang="c++",
+                        ["a.o"],
+                        os.path.join(d, f"{name}.so"),
+                        extra_postargs=post,
+                        target_lang="c++",
                     )
         dlink_cmd, plain_cmd = cmds
         self.assertEqual(dlink_cmd[0], "/rocm/bin/hipcc")
