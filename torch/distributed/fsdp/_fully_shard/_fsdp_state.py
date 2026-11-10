@@ -3,6 +3,7 @@
 import functools
 import logging
 import warnings
+import weakref
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from typing import Any, Generic, TYPE_CHECKING, TypeVar
@@ -74,6 +75,10 @@ class FSDPState(_State):
         # Each group has params with the same mesh_info.
         self._fsdp_param_groups: list[FSDPParamGroup] = []
         self._is_root: bool | None = None  # root set during lazy init
+        # State of the nearest ``fully_shard`` call enclosing this state's
+        # modules, held weakly so that it does not extend that state's
+        # lifetime; lazy init walks up these to find the root
+        self._enclosing_state: weakref.ref[FSDPState] | None = None
         self._state_ctx = FSDPStateContext()
         self._comm_ctx = FSDPCommContext()
         self._training_state: TrainingState = TrainingState.IDLE
@@ -87,6 +92,9 @@ class FSDPState(_State):
     def _get_state_for_module(self, module: nn.Module) -> "FSDPState | None":
         """Get the state for a module. Subclasses can override to use different state getters."""
         return _get_module_fsdp_state(module)
+
+    def _get_enclosing_state(self) -> "FSDPState | None":
+        return None if self._enclosing_state is None else self._enclosing_state()
 
     @property
     def _fsdp_param_group(self) -> FSDPParamGroup | None:
@@ -120,6 +128,15 @@ class FSDPState(_State):
         for module in modules:
             _insert_module_state(module, self)
         self._modules = modules
+        # ``fully_shard`` runs bottom-up, so a state that already has an
+        # enclosing state is inside a nearer one
+        for module in modules:
+            for submodule in module.modules():
+                state = self._get_state_for_module(submodule)
+                if state is None or state is self:
+                    continue
+                if state._get_enclosing_state() is None:
+                    state._enclosing_state = weakref.ref(self)
         self._device = device
         self._device_handle = _get_device_handle(device.type)
         self._mp_policy = replace(mp_policy, param_dtype_override_fn=None)
@@ -180,11 +197,23 @@ class FSDPState(_State):
         """
         Lazy initialization represents when all modules' parallelisms have
         finalized (e.g. FSDP has been applied to all desired modules). This
-        means that we can determine which state is the root, and we do so by
-        the 1st state to run forward.
+        means that we can determine which state is the root, and we do so when
+        the 1st state runs forward. The root is the outermost state enclosing
+        that state, so submodules may run forward before the root module.
         """
         if self._is_root is not None:
             return  # no-op: already initialized
+        # Multi-module states cannot be the root, so skip them
+        root_state = None
+        state = self._get_enclosing_state()
+        while state is not None:
+            if len(state._modules) == 1:
+                root_state = state
+            state = state._get_enclosing_state()
+        if root_state is not None:
+            root_state._lazy_init()
+            if self._is_root is not None:
+                return
         if len(self._modules) > 1:
             raise RuntimeError(
                 f"{self._state_name} requires a single root module but got {self._modules}"
