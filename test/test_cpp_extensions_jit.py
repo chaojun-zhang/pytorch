@@ -1405,7 +1405,6 @@ class TestRocmDlinkArgs(common.TestCase):
         with (
             mock.patch.object(torch.utils.cpp_extension, "IS_HIP_EXTENSION", True),
             mock.patch.object(torch.utils.cpp_extension, "IS_WINDOWS", True),
-            mock.patch.object(torch.utils.cpp_extension, "ROCM_HOME", None),
         ):
             with self.assertRaisesRegex(
                 RuntimeError, "not supported for ROCm extensions on Windows"
@@ -1461,7 +1460,7 @@ class TestRocmDlinkArgs(common.TestCase):
 
     @unittest.skipIf(IS_WINDOWS, "unix compiler only")
     def test_hip_dlink_link_uses_hipcc(self):
-        from setuptools._distutils.ccompiler import new_compiler
+        from setuptools._distutils.ccompiler import new_compiler  # codespell:ignore
 
         compiler = new_compiler(compiler="unix")
         # A launcher in front of the compiler, as with CXX="ccache g++".

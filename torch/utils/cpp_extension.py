@@ -1759,6 +1759,7 @@ def CUDAExtension(name, sources, *args, **kwargs):
         kwargs['extra_compile_args'] = extra_compile_args
         # The legacy offload driver (default for -fgpu-rdc on ROCm 7.0) device-links only
         # for the archs on the link line, so pass the same arch flags as the compile.
+        # --hip-link also marks this extension for the hipcc link in _wrap_hip_dlink_link.
         kwargs['extra_link_args'] = (
             list(kwargs.get('extra_link_args', []))
             + ['-fgpu-rdc', '--hip-link']
