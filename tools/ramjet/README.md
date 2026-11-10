@@ -8,6 +8,16 @@ python -m tools.ramjet --gpu H100 -- pytest test/test_nn.py -k linear
 
 The runner, the sandbox your command runs in, takes `modal shell`'s options. `--gpu` takes GPUs as Modal names them, in any case, with `:N` for N of them: `L4`, `A100-80GB`, `H100`, `B200:8`; without it the runner has no GPU. `--cpu` sets its physical cores, 1 to 64 in powers of two, and `--memory` its memory in MiB, 8192 to 344064; by default it gets 8 cores per GPU, or 8 without one, and 8192 MiB per core. Modal has no CPU types, so the CPU model and its instruction set can't be chosen. The builder is always the same: 64 cores and no GPU. `--help` lists every choice. `--build-cuda` picks the CUDA version to build with: any that CI builds an image for and that has an official arch list, 12.6, 13.2 and 13.4 today. The default is the version of PyTorch's default wheel. `--python-version` picks the Python version, the same in the builder and the runner, which boots from the builder's image: any PyTorch ships wheels for, 3.11 to 3.15 with the free-threaded `t` builds. The default is the one in CI's image, 3.11 today. `--log-level` sets the least severe messages ramjet shows: `debug`, `info` (the default), `warn` or `error`. Everything after `--` is the command, run as given in the directory you run ramjet from: `pytest test/test_nn.py -k linear`, `nvidia-smi`, or `bash -c '...'` for pipes and `&&`.
 
+## Listing tests
+
+`test --list` prints the tests under the paths you name, one line of JSON each, without running them:
+
+```
+python -m tools.ramjet --gpu L4 test --list test/dynamo -- -k guard
+```
+
+The test files are collected in parallel: Modal spreads them over as many containers as it gives you, and a container collects as many at once as it has cores. Each file is launched the way `run_test.py` launches it, so the list is what would run from that file on that GPU. A path is a test file, a directory of them, or a node id such as `test/test_nn.py::TestNN`, among the test files `run_test.py` runs; for others, use `-- pytest`. Arguments after `--` go to pytest's collection. A container gets 4 cores and 16384 MiB per GPU, or as much without one, unless `--cpu` and `--memory` say otherwise, and bills as a Modal Function, at a third of a sandbox's rates for cores and memory. If a file can't be collected, ramjet shows the end of its output and exits 1. `--log-level debug` shows how long each file took and which container collected it. `test` can't run the tests yet.
+
 ## Setup
 
 ```

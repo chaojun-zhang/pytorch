@@ -3,6 +3,8 @@
 import contextlib
 import getpass
 import importlib.util
+import io
+import json
 import os
 import shutil
 import subprocess
@@ -33,7 +35,7 @@ from tools.ramjet import common, inputs, lineage, sync
 HAS_MODAL = importlib.util.find_spec("modal") is not None
 if HAS_MODAL:
     import tools.ramjet.__main__ as cli
-    from tools.ramjet import build, run
+    from tools.ramjet import build, run, test, worker
 
 sys.path.remove(str(REPO_ROOT))
 
@@ -59,6 +61,18 @@ CMAKE_LISTS = """\
 cmake_minimum_required(VERSION 3.18)
 project(demo C)
 add_library(demo demo.c)
+"""
+# Stands in for a test file: what collect reads is what its launcher prints. The
+# second test's parametrization is how the file was launched: its arguments and its
+# PYTHONPATH
+TEST_FILE = """\
+import os
+import sys
+
+print("Running 2 items in this shard")
+print("test/test_file.py::TestFile::test_first")
+launched = [*sys.argv[1:], os.environ.get("PYTHONPATH", "no PYTHONPATH")]
+print(f"test/test_file.py::TestFile::test_second[{' '.join(launched)}]")
 """
 
 
@@ -244,6 +258,82 @@ class TestRepo(TestCase):
         self.assertEqual(files(runner), files(self.repo))
 
     @unittest.skipUnless(HAS_MODAL, "needs modal")
+    def test_list_tests(self) -> None:
+        container = self.tmp / "container"  # its /pytorch, at the build image's commit
+        container.mkdir()
+        sync.archive(self.base, ["."], self.tmp / "base.tar")
+        subprocess.run(["tar", "-xf", self.tmp / "base.tar"], cwd=container, check=True)
+        self.edit()
+        self.write("test/test_file.py", TEST_FILE)
+        self.write("test/test_broken.py", "raise ImportError('no such module')\n")
+        commit = sync.snapshot_tree()
+
+        def local_map(names: list[str], kwargs: Any, return_exceptions: bool) -> Any:
+            started = worker.Worker()  # this process stands in for the container
+            started.sync()
+            lost = {"test_lost": ConnectionError("container lost")}
+            return [lost.get(n) or started.collect(n, **kwargs) for n in names]
+
+        modal = mock.MagicMock()  # stands in for Modal
+        image = modal.Image.from_id.return_value.run_commands.return_value
+
+        def add_local_file(local: str, remote: str) -> Any:
+            shutil.copyfile(local, remote)  # where the container finds it
+            return image
+
+        image.add_local_file.side_effect = add_local_file
+        new_app = modal.App.return_value
+        new_app.cls.return_value.return_value.return_value.collect.map = local_map
+        modal_sets = {"PYTHONPATH": "/pkg/:/root/", "MODAL_TASK_ID": "ta-1"}
+        for patcher in [
+            mock.patch.object(test, "modal", modal),
+            mock.patch.object(worker, "ROOT", str(container)),
+            mock.patch.object(worker, "CHANGES", str(self.tmp / "changes.tar")),
+            mock.patch.object(worker, "DELETED", str(self.tmp / "deleted")),
+            mock.patch.dict(os.environ, modal_sets),
+        ]:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        build_image = lineage.Build("im-1", self.base, taken=0.0)
+        sizes = (test.CORES_PER_GPU, test.MIB_PER_CORE)
+        resources = run.resources("L4", None, None, *sizes)
+        names = {
+            "test_file": ["test/test_file.py::TestFile::test_second"],
+            "test_broken": ["test/test_broken.py"],
+            "test_lost": ["test/test_lost.py"],
+        }
+        args = (build_image, commit, resources, names, ["-k", "second", "-v"], self.tmp)
+        with self.assertLogs(test.log, "DEBUG") as logs:
+            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(test.list_tests(*args), 1)
+        launched = "--use-pytest --collect-only -k second -v --verbosity=-1"
+        nodeid = f"test/test_file.py::TestFile::test_second[{launched} no PYTHONPATH]"
+        listed = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        self.assertEqual(listed, [{"nodeid": nodeid}])
+        messages = [record.getMessage() for record in logs.records]
+        self.assertEqual(messages[0], "collecting 3 files on L4")
+        took = r"^test/test_%s\.py took \d+\.\d s on container ta-1$"
+        self.assertRegex(messages[1], took % "file")
+        self.assertRegex(messages[2], took % "broken")
+        self.assertIn("test/test_broken.py failed:", messages[3])
+        self.assertIn("ImportError: no such module", messages[3])
+        self.assertIn("test/test_lost.py failed:", messages[4])
+        self.assertIn("container lost", messages[4])
+        self.assertEqual(messages[5], "listed 1 test from 1 file")
+        self.assertEqual(files(container), files(self.repo))  # synced first
+        options = {
+            "image": image,
+            "scaledown_window": test.SCALEDOWN_SECONDS,
+            "gpu": "L4",
+            "cpu": 4,
+            "memory": 16384,
+        }
+        new_app.cls.assert_called_once_with(**options)
+        modal.concurrent.assert_called_once_with(max_inputs=4)  # a file per core
+        modal.concurrent.return_value.assert_called_once_with(worker.Worker)
+
+    @unittest.skipUnless(HAS_MODAL, "needs modal")
     @unittest.skipUnless(shutil.which("setsid"), "needs util-linux's setsid")
     def test_execute(self) -> None:
         (self.repo / "sub").mkdir()
@@ -355,6 +445,12 @@ class TestRun(TestCase):
         self.assertEqual(run.resources(None, 32, None), (None, 32, 262144))
         self.assertEqual(run.resources("B200:8", 2, None), ("B200:8", 2, 16384))
         self.assertEqual(run.resources("H100", 64, 8192), ("H100", 64, 8192))
+        # test's containers are smaller
+        sizes = (test.CORES_PER_GPU, test.MIB_PER_CORE)
+        self.assertEqual(run.resources(None, None, None, *sizes), (None, 4, 16384))
+        two = run.resources("H100:2", None, None, *sizes)
+        self.assertEqual(two, ("H100:2", 8, 32768))
+        self.assertEqual(run.resources("L4", 8, None, *sizes), ("L4", 8, 32768))
 
     def test_hourly_rate(self) -> None:
         def rate(*request: Any) -> Decimal:  # from --gpu, --cpu and --memory
@@ -464,7 +560,8 @@ class TestCli(TestCase):
         cudas, stable = list(build.ci_images()), build.stable_cuda()
         pythons = build.python_versions()
         self.assertIn(stable, cudas)
-        defaults = (None, None, stable, None, "info")  # every option but --gpu
+        # Every option but --gpu, and no subcommand
+        defaults = (None, None, stable, None, "info", None)
         self.assertEqual(parse("--", "ls"), (None, *defaults, ["ls"]))
         command = ["pytest", "test/test_nn.py", "-k", "linear or conv"]
         argv = ["--gpu", "H100", "--", *command]
@@ -472,10 +569,18 @@ class TestCli(TestCase):
         cuda, python = f"--build-cuda={cudas[-1]}", f"--python-version={pythons[-1]}"
         options = ["--cpu=16", "--memory=131072", cuda, python, "--log-level=debug"]
         argv = ["--gpu=b200+:8", *options, "--", "nvidia-smi"]  # in any case
-        expected = ("B200+:8", 16, 131072, cudas[-1], pythons[-1], "debug", argv[-1:])
-        self.assertEqual(parse(*argv), expected)
+        expected = ("B200+:8", 16, 131072, cudas[-1], pythons[-1], "debug", None)
+        self.assertEqual(parse(*argv), (*expected, argv[-1:]))
         argv = ["--", "a", "--", "b"]  # later --s are the command's
         self.assertEqual(parse(*argv), (None, *defaults, ["a", "--", "b"]))
+        # test: its own options and the paths, then pytest's arguments after --
+        paths = ["test/dynamo", "test/test_nn.py::TestNN"]
+        listing = ("test", True, paths)
+        argv = ["--gpu", "L4", "test", "--list", *paths]
+        self.assertEqual(parse(*argv), ("L4", *defaults[:-1], *listing, []))
+        argv = ["test", *paths, "--list", "--", "-k", "linear", "--", "-x"]
+        pytest_args = ["-k", "linear", "--", "-x"]
+        self.assertEqual(parse(*argv), (None, *defaults[:-1], *listing, pytest_args))
         bad = [
             [],  # no command
             ["--gpu", "L4", "--"],
@@ -488,10 +593,66 @@ class TestCli(TestCase):
             ["--build-cuda=9.9", "--", "ls"],
             ["--python-version=3.9", "--", "ls"],
             ["--log-level=dev", "--", "ls"],
+            ["test", "--list"],  # no paths
+            ["test", "test/dynamo"],  # only --list is built
+            ["test", "--gpu", "L4", "--list", "test/dynamo"],  # --gpu goes before test
+            ["test/dynamo"],
         ]
         for argv in bad:
             with self.subTest(argv=argv), self.assertRaises(SystemExit):
                 parse(*argv)
+
+
+@skipIfWindows(msg="ramjet runs on Linux and macOS")
+@unittest.skipUnless(HAS_MODAL, "needs modal")
+class TestTest(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+    THIS = "tools/ramjet/test_ramjet"  # this file, as run_test.py names it
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(REPO_ROOT)
+        common.repo_root.cache_clear()
+        self.addCleanup(common.repo_root.cache_clear)
+
+    def test_names(self) -> None:
+        file_id = f"test/{self.THIS}.py"
+        self.assertEqual(test.names([file_id]), {self.THIS: [file_id]})
+        self.assertEqual(test.names(["test/tools/ramjet"]), {self.THIS: [file_id]})
+        node_id = f"{file_id}::TestCli::test_parse_args"
+        both = [node_id, file_id]
+        self.assertEqual(test.names(both), {self.THIS: both})
+        os.chdir("test/tools")  # paths are from where you are
+        self.assertEqual(test.names(["ramjet/test_ramjet.py"]), {self.THIS: [file_id]})
+        os.chdir(REPO_ROOT)
+        everything = test.names(["test"])
+        self.assertIn(self.THIS, everything)
+        self.assertIn("test_torch", everything)
+        # run_test.py also knows names that are not test files, such as doctests
+        no_file = [n for n in everything if not Path(f"test/{n}.py").is_file()]
+        self.assertEqual(no_file, [])
+        bad = [
+            "test/fx",  # run by test_fx.py, not on their own
+            "test/fx/test_common_passes.py",
+            "test/missing.py",
+            "test/tools/ramjet::TestCli",  # a node id names a file
+            "tools/ramjet",  # not under test/
+        ]
+        for path in bad:
+            with self.subTest(path=path), exits(self, f"-- pytest {path}"):
+                test.names([path])
+
+    def test_collect(self) -> None:
+        with mock.patch.object(worker, "ROOT", str(REPO_ROOT)):
+            # This file, launched as run_test.py launches it
+            collected = worker.Worker().collect(self.THIS, ["-k", "test_names", "-v"])
+            missing = worker.Worker().collect("tools/ramjet/missing", [])
+        ids = [f"test/{self.THIS}.py::TestTest::test_names"]
+        self.assertEqual((collected["ids"], collected["error"]), (ids, ""))
+        self.assertGreater(collected["seconds"], 0)
+        self.assertEqual(missing["ids"], [])
+        self.assertIn("missing.py", missing["error"])
 
 
 if __name__ == "__main__":

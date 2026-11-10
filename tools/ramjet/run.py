@@ -86,11 +86,17 @@ def gpu_count(gpu: str | None) -> int:
     return 0 if gpu is None else int(gpu.partition(":")[2] or 1)
 
 
-def resources(gpu: str | None, cpu: int | None, memory: int | None) -> Resources:
-    """The runner's resources from --gpu, --cpu and --memory, the last two by
-    default sized by the GPUs, within Modal's largest sandbox."""
-    cpu = cpu or min(CORES_PER_GPU * max(gpu_count(gpu), 1), MAX_CORES)
-    memory = memory or min(MIB_PER_CORE * cpu, MAX_GIB * 1024)
+def resources(
+    gpu: str | None,
+    cpu: int | None,
+    memory: int | None,
+    cores_per_gpu: int = CORES_PER_GPU,
+    mib_per_core: int = MIB_PER_CORE,
+) -> Resources:
+    """The resources --gpu, --cpu and --memory ask for, the last two by default
+    sized by the GPUs, within Modal's largest sandbox."""
+    cpu = cpu or min(cores_per_gpu * max(gpu_count(gpu), 1), MAX_CORES)
+    memory = memory or min(mib_per_core * cpu, MAX_GIB * 1024)
     return Resources(gpu, cpu, memory)
 
 

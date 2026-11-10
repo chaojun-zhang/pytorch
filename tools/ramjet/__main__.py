@@ -1,6 +1,8 @@
-"""Build this worktree on Modal and run a command on a runner you size:
+"""Build this worktree on Modal and run a command on a runner you size, or list the
+tests under a path as containers of that size collect them:
 
     python -m tools.ramjet [OPTIONS] -- COMMAND [ARGS...]
+    python -m tools.ramjet [OPTIONS] test --list PATH... [-- PYTEST_ARGS...]
 
 As in modal shell, --gpu, such as H100 or B200:8, --cpu and --memory size the runner;
 without --gpu it has no GPU. A 64-core builder keeps an incremental build of your
@@ -17,19 +19,24 @@ from pathlib import Path
 
 import modal
 
-from tools.ramjet import build, common, lineage, run, sync
+from tools.ramjet import build, common, lineage, run, sync, test
 from tools.ramjet.logger import LEVEL_NAMES, log, setup_logger
 
 
+PROG = "python -m tools.ramjet"
+TEST_USAGE = f"{PROG} [OPTIONS] test --list PATH... [-- PYTEST_ARGS...]"
+
+
 def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
-    """ramjet's options, and the command after the first --, as given."""
+    """ramjet's options, and what follows the first --, as given: the command, or
+    test's pytest arguments."""
     split = argv.index("--") if "--" in argv else len(argv)
-    parser = argparse.ArgumentParser(
-        prog="python -m tools.ramjet",
-        usage="%(prog)s [OPTIONS] -- COMMAND [ARGS...]",
-    )
+    usage = f"{PROG} [OPTIONS] -- COMMAND [ARGS...]\n       {TEST_USAGE}"
+    parser = argparse.ArgumentParser(prog=PROG, usage=usage)
     # Named and given as modal shell takes them
-    runner_group = parser.add_argument_group("runner (the sandbox COMMAND runs in)")
+    runner_group = parser.add_argument_group(
+        "runner (the sandbox COMMAND runs in, or each of test's containers)"
+    )
     runner_group.add_argument(
         "--gpu",
         type=str.upper,  # as Modal does
@@ -41,13 +48,14 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         "--cpu",
         type=int,
         choices=run.CPU_CHOICES,
-        help=f"physical cores (default: {cores})",
+        help=f"physical cores (default: {cores}; for test, {test.CORES_PER_GPU})",
     )
     runner_group.add_argument(
         "--memory",
         type=int,
         choices=run.MEMORY_CHOICES,
-        help=f"memory in MiB (default: {run.MIB_PER_CORE} per core)",
+        help=f"memory in MiB (default: {run.MIB_PER_CORE} per core; "
+        f"for test, {test.MIB_PER_CORE})",
     )
     build_group = parser.add_argument_group("build")
     build_group.add_argument(
@@ -67,10 +75,32 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         default="info",
         help="the least severe messages to show (default: %(default)s)",
     )
-    options, command = parser.parse_args(argv[:split]), argv[split + 1 :]
-    if not command:
+    commands = parser.add_subparsers(dest="subcommand", title="subcommands")
+    test_parser = commands.add_parser(
+        "test",
+        usage=TEST_USAGE,
+        help="list the tests under each PATH, as containers of this size collect them",
+        description="Collect each test file under the PATHs in a container sized by "
+        "--gpu, --cpu and --memory. PYTEST_ARGS go to the collection, so -- -k linear "
+        "lists fewer tests.",
+    )
+    test_parser.add_argument(
+        "--list",
+        action="store_true",
+        required=True,  # until test can run them
+        help="print each test as a line of JSON on stdout, and run nothing",
+    )
+    test_parser.add_argument(
+        "paths",
+        nargs="+",
+        metavar="PATH",
+        help="a test file, a directory of them, or a node id such as "
+        "test/test_nn.py::TestNN, that run_test.py runs",
+    )
+    options, rest = parser.parse_args(argv[:split]), argv[split + 1 :]
+    if options.subcommand is None and not rest:
         parser.error("the command to run goes after --")
-    return options, command
+    return options, rest
 
 
 def image_for(
@@ -130,10 +160,14 @@ def image_for(
 
 def main() -> int:
     setup_logger()  # first: reading the options can fail
-    options, command = parse_args(sys.argv[1:])
+    options, arguments = parse_args(sys.argv[1:])
     log.setLevel(LEVEL_NAMES[options.log_level])
+    testing = options.subcommand == "test"
+    # Before any build, and where you are: a path run_test.py doesn't run fails fast
+    names = test.names(options.paths) if testing else {}
     cuda = options.build_cuda
-    resources = run.resources(options.gpu, options.cpu, options.memory)
+    sizes = (test.CORES_PER_GPU, test.MIB_PER_CORE) if testing else ()
+    resources = run.resources(options.gpu, options.cpu, options.memory, *sizes)
     config = {**build.default_config(cuda), **lineage.build_config(os.environ)}
     # Before any build, so a GPU missing from Modal's rate card, or one the build
     # can't run on, fails fast
@@ -153,6 +187,8 @@ def main() -> int:
             fcntl.flock(lock, fcntl.LOCK_EX)
         commit = sync.snapshot_tree()
         image = image_for(app, commit, ramjet_dir, cuda, options.python_version, config)
+    if testing:
+        return test.list_tests(image, commit, resources, names, arguments, ramjet_dir)
     # The warm runner of this size
     gpu, cpu, memory = resources
     saved = ramjet_dir / f"runner-{gpu or 'no-gpu'}-{cpu}-{memory}.json"
@@ -176,11 +212,11 @@ def main() -> int:
             run.sync_files(runner, synced, commit, ramjet_dir)
             if keep:
                 run.remember(saved, runner, image, commit)
-            code = run.execute(runner, command, str(cwd))
+            code = run.execute(runner, arguments, str(cwd))
         finally:
             if not keep:
                 runner.terminate()
-    log.debug("%s exited %d", command[0], code)
+    log.debug("%s exited %d", arguments[0], code)
     return code
 
 
