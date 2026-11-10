@@ -1,5 +1,5 @@
 """Build this worktree on Modal and run a command on a runner you size, or list the
-tests under a path as containers of that size collect them:
+tests under a path that containers of that size can run:
 
     python -m tools.ramjet [OPTIONS] -- COMMAND [ARGS...]
     python -m tools.ramjet [OPTIONS] test --list PATH... [-- PYTEST_ARGS...]
@@ -79,10 +79,11 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     test_parser = commands.add_parser(
         "test",
         usage=TEST_USAGE,
-        help="list the tests under each PATH, as containers of this size collect them",
+        help="list the tests under each PATH that containers of this size can run",
         description="Collect each test file under the PATHs in a container sized by "
-        "--gpu, --cpu and --memory. PYTEST_ARGS go to the collection, so -- -k linear "
-        "lists fewer tests.",
+        "--gpu, --cpu and --memory, which leaves out the tests whose tci constraints "
+        "it doesn't meet. PYTEST_ARGS go to the collection, so -- -k linear lists "
+        "fewer tests.",
     )
     test_parser.add_argument(
         "--list",

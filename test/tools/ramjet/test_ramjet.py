@@ -62,17 +62,23 @@ cmake_minimum_required(VERSION 3.18)
 project(demo C)
 add_library(demo demo.c)
 """
-# Stands in for a test file: what collect reads is what its launcher prints. The
-# second test's parametrization is how the file was launched: its arguments and its
-# PYTHONPATH
+# Stands in for a test file: what collect reads is what its launcher prints, and
+# what tci's plugin writes of the tests it deselects. The second test's
+# parametrization is how the file was launched: its arguments and its PYTHONPATH
 TEST_FILE = """\
+import json
 import os
 import sys
 
 print("Running 2 items in this shard")
 print("test/test_file.py::TestFile::test_first")
 launched = [*sys.argv[1:], os.environ.get("PYTHONPATH", "no PYTHONPATH")]
-print(f"test/test_file.py::TestFile::test_second[{' '.join(launched)}]")
+deselected = launched.pop(4).removeprefix("--tci-deselected=")
+second = "test/test_file.py::TestFile::test_second"
+print(f"{second}[{' '.join(launched)}]")
+unmet = {"[two]": "@tci.needs(tci.gpus >= 2)", "_rocm": "@tci.only(tci.rocm)"}
+with open(deselected, "w") as file:
+    json.dump({second + test: constraint for test, constraint in unmet.items()}, file)
 """
 
 
@@ -307,20 +313,25 @@ class TestRepo(TestCase):
         with self.assertLogs(test.log, "DEBUG") as logs:
             with contextlib.redirect_stdout(io.StringIO()) as stdout:
                 self.assertEqual(test.list_tests(*args), 1)
-        launched = "--use-pytest --collect-only -k second -v --verbosity=-1"
-        nodeid = f"test/test_file.py::TestFile::test_second[{launched} no PYTHONPATH]"
+        launched = f"--use-pytest --collect-only -p {worker.TCI} -k second -v"
+        second = "test/test_file.py::TestFile::test_second"
+        nodeid = f"{second}[{launched} --verbosity=-1 no PYTHONPATH]"
         listed = [json.loads(line) for line in stdout.getvalue().splitlines()]
         self.assertEqual(listed, [{"nodeid": nodeid}])
         messages = [record.getMessage() for record in logs.records]
         self.assertEqual(messages[0], "collecting 3 files on L4")
         took = r"^test/test_%s\.py took \d+\.\d s on container ta-1$"
         self.assertRegex(messages[1], took % "file")
-        self.assertRegex(messages[2], took % "broken")
-        self.assertIn("test/test_broken.py failed:", messages[3])
-        self.assertIn("ImportError: no such module", messages[3])
-        self.assertIn("test/test_lost.py failed:", messages[4])
-        self.assertIn("container lost", messages[4])
-        self.assertEqual(messages[5], "listed 1 test from 1 file")
+        # Of the two tests tci left out, the one under the node id asked for
+        needs = "@tci.needs(tci.gpus >= 2)"
+        self.assertEqual(messages[2], f"left out {second}[two]: {needs}")
+        self.assertRegex(messages[3], took % "broken")
+        self.assertIn("test/test_broken.py failed:", messages[4])
+        self.assertIn("ImportError: no such module", messages[4])
+        self.assertIn("test/test_lost.py failed:", messages[5])
+        self.assertIn("container lost", messages[5])
+        left_out = ["left out 1 test that L4 can't run:", f"  1 with {needs}"]
+        self.assertEqual(messages[6:], ["listed 1 test from 1 file", *left_out])
         self.assertEqual(files(container), files(self.repo))  # synced first
         options = {
             "image": image,
@@ -650,6 +661,7 @@ class TestTest(TestCase):
             missing = worker.Worker().collect("tools/ramjet/missing", [])
         ids = [f"test/{self.THIS}.py::TestTest::test_names"]
         self.assertEqual((collected["ids"], collected["error"]), (ids, ""))
+        self.assertEqual(collected["left_out"], {})  # no test here has a constraint
         self.assertGreater(collected["seconds"], 0)
         self.assertEqual(missing["ids"], [])
         self.assertIn("missing.py", missing["error"])

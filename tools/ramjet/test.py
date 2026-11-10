@@ -1,10 +1,13 @@
-"""ramjet test: the tests under the paths you name, as they collect on the GPUs you
-name. Each test file is one call to a Modal Function, which Modal spreads over as
-many containers as it gives you, each taking as many calls at once as it has cores."""
+"""ramjet test: the tests under the paths you name that the GPUs you name can run.
+Each test file is one call to a Modal Function, which Modal spreads over as many
+containers as it gives you, each taking as many calls at once as it has cores. A
+container collects the file's tests and leaves out those whose tci constraints
+(torch/testing/_internal/tci) its machine doesn't meet."""
 
 import json
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 import modal
@@ -107,28 +110,41 @@ def list_tests(
     pytest_args: list[str],
     ramjet_dir: Path,
 ) -> int:
-    """Print the tests asked for that these containers collect, one JSON object per
+    """Print the tests asked for that these containers can run, one JSON object per
     line, and return the exit code: 1 if a file's tests couldn't be collected."""
     on = resources.gpu or "a CPU container"
     log.info("collecting %s on %s", count(len(names), "file"), on)
     results = collect(image, commit, resources, list(names), pytest_args, ramjet_dir)
     listed = failed = 0
+    left_out: Counter[str] = Counter()  # tests, by the tci constraint that fails
     for (name, asked), result in zip(names.items(), results):
         if isinstance(result, Exception):  # Modal lost the call
-            lost = repr(result)
-            result = worker.Collected(ids=[], error=lost, seconds=0, container="")
+            error = repr(result)
         else:
             took = result["seconds"], result["container"]
             log.debug("test/%s.py took %.1f s on container %s", name, *took)
-        if error := result["error"].rstrip():
+            error = result["error"].rstrip()
+            # A node id also asks for the tests under it and for its parametrizations
+            under = tuple(f"{a}{mark}" for a in asked for mark in ("::", "["))
+            # A test that can run here has None; one left out, its constraint
+            verdicts = {**dict.fromkeys(result["ids"]), **result["left_out"]}
+            for nodeid, unmet in verdicts.items():
+                if nodeid not in asked and not nodeid.startswith(under):
+                    continue
+                if unmet:
+                    log.debug("left out %s: %s", nodeid, unmet)
+                    left_out[unmet] += 1
+                else:
+                    print(json.dumps({"nodeid": nodeid}))
+                    listed += 1
+        if error:
             log.error("collecting test/%s.py failed:\n%s", name, error)
             failed += 1
-        # A node id also asks for the tests under it and for its parametrizations
-        under = tuple(f"{a}{mark}" for a in asked for mark in ("::", "["))
-        for nodeid in result["ids"]:
-            if nodeid in asked or nodeid.startswith(under):
-                print(json.dumps({"nodeid": nodeid}))
-                listed += 1
     files = count(len(names) - failed, "file")
     log.info("listed %s from %s", count(listed, "test"), files)
+    if left_out:
+        tests = count(left_out.total(), "test")
+        log.info("left out %s that %s can't run:", tests, on)
+        for unmet, n in left_out.most_common():
+            log.info("  %d with %s", n, unmet)
     return 1 if failed else 0

@@ -2,9 +2,11 @@
 brings its /pytorch to your working tree once, and then serves calls. It is imported
 in the containers, so it uses only the standard library and modal."""
 
+import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import TypedDict
@@ -17,10 +19,13 @@ ROOT = "/pytorch"
 CHANGES = "/tmp/ramjet/changes.tar"
 DELETED = "/tmp/ramjet/deleted"  # paths, NUL-separated
 TAIL = 2000  # characters of a failed collect's output to return
+# pytest's plugin that deselects the tests whose tci constraints a machine doesn't meet
+TCI = "torch.testing._internal.tci.plugin"
 
 
 class Collected(TypedDict):
     ids: list[str]  # as pytest prints them: test/test_nn.py::TestNN::test_linear
+    left_out: dict[str, str]  # the tests tci leaves out here: the constraint unmet
     error: str  # the end of the output if collecting failed, else empty
     seconds: float  # how long collecting took
     container: str  # Modal's id for the container that did it
@@ -38,23 +43,28 @@ class Worker:
 
     @modal.method()
     def collect(self, name: str, pytest_args: list[str]) -> Collected:
-        """The tests run_test.py would run here from one of its test files."""
+        """The tests run_test.py would run here from one of its test files, without
+        those that tci leaves out on this machine."""
         # Launched as run_test.py launches it, so the file's __main__ guard decides
         # here too: pytest alone collects files that guard never lets run
         launch = [sys.executable, "-bb", f"{name}.py", "--use-pytest", "--collect-only"]
-        # Last, so a -v among your arguments can't turn the ids into a tree
-        command = [*launch, *pytest_args, "--verbosity=-1"]
         # Modal's PYTHONPATH holds its own packages and the tools/ it mounts to import
         # this module, which would shadow /pytorch/tools; the image sets none
         env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
         output = {"capture_output": True, "text": True, "errors": "replace"}
         start = time.monotonic()
-        done = subprocess.run(command, cwd=f"{ROOT}/test", env=env, **output)
+        with tempfile.NamedTemporaryFile() as deselected:
+            plugin = ["-p", TCI, f"--tci-deselected={deselected.name}"]
+            # Last, so a -v among your arguments can't turn the ids into a tree
+            command = [*launch, *plugin, *pytest_args, "--verbosity=-1"]
+            done = subprocess.run(command, cwd=f"{ROOT}/test", env=env, **output)
+            left_out = deselected.read()  # nothing, if the file started no pytest
         failed = done.returncode != 0
         prefix = f"test/{name}.py::"  # the other lines are the file's own output
         lines = [] if failed else done.stdout.splitlines()
         return {
             "ids": [line for line in lines if line.startswith(prefix)],
+            "left_out": json.loads(left_out) if left_out and not failed else {},
             "error": (done.stderr + done.stdout)[-TAIL:] if failed else "",
             "seconds": time.monotonic() - start,
             "container": os.environ.get("MODAL_TASK_ID", ""),
