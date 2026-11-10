@@ -52,7 +52,7 @@ from ..optimize_indexing import (
     indexing_dtype_strength_reduction,
 )
 from ..runtime.coordinate_descent_tuner import CoordescTuner
-from ..runtime.hints import DeviceProperties, InductorMeta
+from ..runtime.hints import DeviceProperties, InductorMeta, TritonMeta
 from ..runtime.runtime_utils import (
     green_text,
     last_power_of_2,
@@ -73,11 +73,22 @@ from ..utils import (
     sympy_index_symbol,
     sympy_product,
     sympy_subs,
+    triton_version_uses_attrs_dict,
     unique,
 )
 from ..virtualized import ops, OpsWrapper, V
 from .block_analysis import BlockPatternMatcher
-from .common import CSEVariable, index_prevent_reordering, Kernel, PythonPrinter
+from .common import (
+    ArgName,
+    ConstexprArg,
+    CSEVariable,
+    index_prevent_reordering,
+    Kernel,
+    KernelArgType,
+    PythonPrinter,
+    SizeArg,
+    TensorArg,
+)
 from .multi_kernel import MultiKernel, SizeHintMultiKernel
 from .simd_kernel_features import (
     DisableReduction,
@@ -2927,6 +2938,274 @@ class _SubParentValueResolver(WrapperHandler):  # type: ignore[type-arg]
         return None
 
 
+class _MixOrderTritonFinalize:
+    """Finalizes consecutive mix-order accumulators with one generated Triton kernel.
+
+    Only active with config.triton.mix_order_reduction_triton_finalize. Each
+    accumulator is an ``[nsplit, rnumel]`` fp32 block of partial sums in the
+    workspace. One program sums all ``nsplit`` rows of ``XBLOCK`` columns of one
+    block and casts on store, writing through the output pointer, so outputs must
+    be contiguous and allocated before the call.
+    """
+
+    # Output pointers per kernel, i.e. accumulators per launch.
+    max_outputs = 4
+    # One program loops over all rows: longer workspaces stay on the ATen sum.
+    max_nsplit = 8192
+
+    def __init__(
+        self,
+        scheduling: SIMDScheduling,
+        kernel: TritonKernel,
+        node_schedule: list[NodeScheduleEntry],
+        ws_name: str,
+        nsplit: sympy.Expr,
+        rnumel: sympy.Expr,
+    ) -> None:
+        self.scheduling = scheduling
+        self.kernel = kernel
+        self.node_schedule = node_schedule
+        self.ws_name = ws_name
+        self.nsplit = nsplit
+        self.rnumel = rnumel
+        self.nsplit_hint = V.graph.sizevars.optimization_hint(nsplit)
+        self.enabled = (
+            config.triton.mix_order_reduction_triton_finalize
+            and self.nsplit_hint <= self.max_nsplit
+        )
+        self.first_idx = 0
+        self.buffer_names: list[str] = []
+
+    def add(self, idx: int, partial_accum: PartialAccumulate) -> bool:
+        """Queue the accumulator if the finalizer supports it; else return False."""
+        if not self.enabled or partial_accum.reduction_type != "sum":
+            return False
+        buffer = V.graph.get_buffer(partial_accum.buffer_name)
+        if not isinstance(buffer, ir.Buffer):
+            return False
+        layout = buffer.get_output_spec()
+        # Exact types, as in the ATen path: it rejects subclasses such as
+        # CommBufferLayout.
+        if not isinstance(layout, ir.Layout) or type(layout) not in (
+            ir.FixedLayout,
+            ir.FlexibleLayout,
+            ir.NonOwningLayout,
+        ):
+            return False
+        if not layout.dtype.is_floating_point or not layout.is_contiguous():
+            return False
+
+        if self.buffer_names and (
+            idx != self.first_idx + len(self.buffer_names)
+            or len(self.buffer_names) == self.max_outputs
+        ):
+            self.flush()
+        if not self.buffer_names:
+            self.first_idx = idx
+        V.graph.wrapper_code.codegen_allocation(buffer)
+        self.buffer_names.append(partial_accum.buffer_name)
+        return True
+
+    def flush(self) -> None:
+        """Define and launch one finalize kernel for the queued accumulators."""
+        if not self.buffer_names:
+            return
+        from .triton import TritonScheduling
+
+        out_args = [
+            TensorArg(f"out_ptr{k}", name, V.graph.get_dtype(name))
+            for k, name in enumerate(self.buffer_names)
+        ]
+        size_args = [
+            SizeArg("ws_offset", self.first_idx * self.nsplit * self.rnumel),
+            SizeArg("nsplit", self.nsplit),
+            SizeArg("xnumel", self.rnumel),
+            SizeArg("ynumel", sympy.Integer(len(out_args))),
+        ]
+        ws_arg = next(
+            ws
+            for ws in self.kernel.args.workspace_args
+            if ws.outer_name == self.ws_name
+        )
+        signature: list[KernelArgType] = [ws_arg, *out_args, *size_args]
+        argdefs = [
+            ArgName("ws_ptr"),
+            *(ArgName(a.name) for a in [*out_args, *size_args]),
+            ArgName("XBLOCK", True),
+            ArgName("R0_BLOCK", True),
+        ]
+        call_args = [self.ws_name, *self.buffer_names, *(a.expr for a in size_args)]
+        triton_meta, inductor_meta = self._metas(signature, argdefs, out_args)
+        src_code = self._source(
+            signature, argdefs, call_args, triton_meta, inductor_meta
+        )
+        if not isinstance(self.scheduling, TritonScheduling):
+            raise AssertionError(type(self.scheduling))
+        # The "red" category counts it with the reductions in profiler summaries.
+        kernel_name = self.scheduling.define_kernel(
+            src_code,
+            self.node_schedule,
+            self.kernel,
+            name_prefix="triton_red_mix_order_finalize",
+        )
+
+        wrapper = V.graph.wrapper_code
+        wrapper.write_triton_header_once()
+        wrapper.generate_kernel_call(
+            kernel_name,
+            call_args,
+            triton=True,
+            arg_types=[
+                torch.float,
+                *(a.dtype for a in out_args),
+                *(type(a.expr) for a in size_args),
+            ],
+            triton_meta=triton_meta,
+            inductor_meta=inductor_meta,
+        )
+        counters["inductor"]["mix_order_triton_finalize"] += 1
+        self.buffer_names = []
+
+    def _metas(
+        self,
+        signature: list[KernelArgType],
+        argdefs: list[ArgName],
+        out_args: list[TensorArg],
+    ) -> tuple[TritonMeta, dict[str, Any]]:
+        from .triton_utils import (
+            config_of,
+            equal_1_arg_indices,
+            signature_to_meta,
+            triton_meta_device_props,
+        )
+
+        kernel_cls = type(self.kernel)
+        meta_signature = list(signature)
+        if triton_version_uses_attrs_dict():
+            meta_signature += [ConstexprArg("XBLOCK"), ConstexprArg("R0_BLOCK")]
+        triton_meta = kernel_cls.triton_meta_common()
+        triton_meta["signature"] = signature_to_meta(
+            meta_signature, size_dtype="tl.int64", argdefs=argdefs
+        )
+        triton_meta["device"] = triton_meta_device_props(
+            V.graph.get_current_device_or_throw()
+        )
+        constants: dict[str, Any] = {}
+        for i in equal_1_arg_indices(meta_signature):
+            if isinstance(arg := meta_signature[i], SizeArg):
+                constants[arg.name] = 1
+        triton_meta["constants"] = constants
+        triton_meta["configs"] = [config_of(meta_signature)]
+
+        inductor_meta = {
+            "grid_type": "Grid2D",
+            "kernel_name": str(Placeholder.DESCRIPTIVE_NAME),
+            **kernel_cls.inductor_meta_common(),
+        }
+        if (
+            config.benchmark_kernel
+            or config.profile_bandwidth
+            or config.benchmark_combo_kernel
+        ):
+            inductor_meta["kernel_num_gb"] = self._num_bytes(out_args) / 1e9
+        return triton_meta, inductor_meta
+
+    def _num_bytes(self, out_args: list[TensorArg]) -> int:
+        nsplit_hint = self.nsplit_hint
+        rnumel_hint = V.graph.sizevars.optimization_hint(self.rnumel)
+        reads = len(out_args) * nsplit_hint * rnumel_hint * 4
+        writes = sum(rnumel_hint * a.dtype.itemsize for a in out_args)
+        return reads + writes
+
+    def _size_hints(self) -> dict[str, int]:
+        # Rounded like TritonKernel's size hints, so that groups of similar shapes
+        # share one kernel source, compile and autotune.
+        return {
+            "x": next_power_of_2(V.graph.sizevars.optimization_hint(self.rnumel)),
+            "r0": next_power_of_2(self.nsplit_hint),
+        }
+
+    def _body(self, num_outputs: int, launch_pdl: bool) -> list[str]:
+        lines = [
+            "xindex = tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)",
+            "xmask = xindex < xnumel",
+            "k = tl.program_id(1)",
+            "base = ws_ptr + ws_offset + k.to(tl.int64) * nsplit * xnumel",
+            "acc = tl.zeros([R0_BLOCK, XBLOCK], tl.float32)",
+        ]
+        # Under PDL, wait for the workspace before the first load. Never trigger
+        # dependents early: the epilogue kernels generated after this one do not
+        # list the mix-order node as a previous node, so they do not wait for
+        # these outputs.
+        if launch_pdl:
+            lines.append(type(self.kernel).GDC_WAIT)
+        lines += [
+            "for r0_offset in range(0, nsplit, R0_BLOCK):",
+            "    r0_index = (r0_offset + tl.arange(0, R0_BLOCK)).to(tl.int64)",
+            "    mask = (r0_index[:, None] < nsplit) & xmask[None, :]",
+            "    acc += tl.load(",
+            "        base + r0_index[:, None] * xnumel + xindex[None, :],",
+            "        mask=mask,",
+            "        other=0.0,",
+            "    )",
+        ]
+        lines.append("result = tl.sum(acc, 0)")
+        for k in range(num_outputs):
+            out = f"out_ptr{k}"
+            lines += [
+                f"if k == {k}:",
+                f"    tl.store({out} + xindex, result.to({out}.dtype.element_ty), xmask)",
+            ]
+        return lines
+
+    def _source(
+        self,
+        signature: list[KernelArgType],
+        argdefs: list[ArgName],
+        call_args: list[Any],
+        triton_meta: TritonMeta,
+        inductor_meta: dict[str, Any],
+    ) -> str:
+        kernel_cls = type(self.kernel)
+        num_outputs = len(self.buffer_names)
+        code = IndentedBuffer()
+        code.splice(kernel_cls.gen_common_triton_imports())
+        device_type = V.graph.get_current_device_or_throw().type
+        if driver_setup := kernel_cls.gen_driver_setup(device_type):
+            code.splice(driver_setup)
+        if config.benchmark_kernel:
+            code.splice(self.kernel.imports_for_benchmark_kernel())
+        code.splice(
+            f"""
+            @triton_heuristics.mix_order_finalize(
+                size_hints={self._size_hints()!r},
+                num_outputs={num_outputs},
+                filename=__file__,
+                triton_meta={triton_meta!r},
+                inductor_meta={inductor_meta!r},
+            )
+            @triton.jit
+            """
+        )
+        params = ", ".join(a.full_name() for a in argdefs)
+        code.writeline(f"def {Placeholder.KERNEL_NAME}({params}):")
+        with code.indent():
+            if config.triton.proton_profiling:
+                code.writeline(f'pl.enter_scope("{Placeholder.KERNEL_NAME}")')
+            code.writelines(
+                self._body(num_outputs, bool(triton_meta.get("launch_pdl")))
+            )
+            if config.triton.proton_profiling:
+                code.writeline(f'pl.exit_scope("{Placeholder.KERNEL_NAME}")')
+        if config.benchmark_kernel:
+            code.splice(
+                self.kernel.codegen_benchmark_harness(
+                    call_args, signature, [], inductor_meta.get("kernel_num_gb")
+                )
+            )
+        return code.getvalue()
+
+
 class SIMDScheduling(BaseScheduling):
     """
     Single Instruction Multiple Data parent class used for fusion across
@@ -3791,13 +4070,20 @@ class SIMDScheduling(BaseScheduling):
                 f"len(kernel.saved_partial_accumulate), got "
                 f"{len(converted_nodes)} and {len(kernel.saved_partial_accumulate)}"
             )
-        nsplit = V.graph.wrapper_code.codegen_python_sizevar(
-            (numel + kernel.rsplit_size - 1) // kernel.rsplit_size
+        nsplit_expr = (numel + kernel.rsplit_size - 1) // kernel.rsplit_size
+        nsplit = V.graph.wrapper_code.codegen_python_sizevar(nsplit_expr)
+        triton_finalize = _MixOrderTritonFinalize(
+            self, kernel, node_schedule, ws_name, nsplit_expr, rnumel
         )
         for idx, partial_accum in enumerate(kernel.saved_partial_accumulate):
             buffer_name = partial_accum.buffer_name
             if buffer_name in V.graph.removed_buffers:
+                triton_finalize.flush()
                 continue
+            if triton_finalize.add(idx, partial_accum):
+                continue
+            triton_finalize.flush()
+            counters["inductor"]["mix_order_aten_finalize"] += 1
 
             stride_str = f"({nsplit}) * ({rnumel})"
             start = f"{idx} * {stride_str}"
@@ -3847,6 +4133,7 @@ class SIMDScheduling(BaseScheduling):
                     f"unsupported mix-order reduction output spec "
                     f"{type(spec).__name__} for {buffer_name}"
                 )
+        triton_finalize.flush()
 
         kernel.deallocate_workspaces()
 

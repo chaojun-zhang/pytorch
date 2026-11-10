@@ -5135,6 +5135,18 @@ def _reduction_configs(
     return configs
 
 
+def reduction_configs_must_be_pinned(inductor_meta: InductorMeta) -> bool:
+    """
+    Whether a reduction must use one config: the block sizes set the summation
+    order, so autotuning them can change the result between compiles.
+    """
+    return bool(
+        inductor_meta.get("deterministic", False)
+        or inductor_meta.get("force_filter_reduction_configs", False)
+        or inductor_meta.get("are_deterministic_algorithms_enabled")
+    )
+
+
 def filter_reduction_configs_for_determinism(
     inductor_meta: InductorMeta, configs: list[Config]
 ) -> list[Config]:
@@ -5152,13 +5164,7 @@ def filter_reduction_configs_for_determinism(
     if len(configs) == 0:
         raise AssertionError("No configs remaining after deduplication")
 
-    def _do_filter_due_to_inductor_config():
-        return (
-            inductor_meta.get("deterministic", False)
-            or inductor_meta.get("force_filter_reduction_configs", False)
-        ) or inductor_meta.get("are_deterministic_algorithms_enabled")
-
-    if not _do_filter_due_to_inductor_config() or len(configs) == 1:
+    if not reduction_configs_must_be_pinned(inductor_meta) or len(configs) == 1:
         # no filtering happening if NOT in deterministic mode
         return configs
 
@@ -5616,6 +5622,62 @@ def user_autotune(
         custom_kernel=custom_kernel,
         # A user kernel keeps its own autotuning, even if a hand edit names it.
         pinnable=False,
+    )
+
+
+def mix_order_finalize(
+    size_hints: dict[str, int],
+    num_outputs: int,
+    triton_meta: TritonMeta,
+    filename=None,
+    inductor_meta: InductorMeta | None = None,
+    return_configs=False,
+):
+    """
+    Compile a mix-order reduction finalize kernel, which sums up to
+    `size_hints["r0"]` rows of up to `size_hints["x"]` columns for each of
+    `num_outputs` outputs. The hints are powers of 2.
+    """
+    inductor_meta = {} if inductor_meta is None else inductor_meta
+    # (XBLOCK, R0_BLOCK, threads), tuned on B200 over x 16..4096, r0 128..8192 and
+    # 1 or 4 outputs against all 24 configs of XBLOCK {8, 16, 32} x R0_BLOCK
+    # {64, 128, 256, 512} x threads {128, 256}. At every point, the default alone
+    # is within 1.32x of the best config, the regular list within 1.04x, and the
+    # max-autotune list within 1.001x.
+    if size_hints["x"] * num_outputs >= 8192:
+        default = (16, 64, 256)
+    else:
+        default = (8, 128, 256)
+    candidates = [default, (8, 64, 256), (16, 64, 256), (16, 512, 128)]
+    if inductor_meta.get("max_autotune") or inductor_meta.get("max_autotune_pointwise"):
+        candidates += [(16, 64, 128), (8, 64, 128), (8, 512, 256), (8, 256, 256)]
+    warp_size = triton_meta["device"].warp_size_or_default
+    max_r0_block = next_power_of_2(size_hints["r0"])
+    configs = unique_configs(
+        [
+            Config(
+                {"XBLOCK": x_block, "R0_BLOCK": min(r0_block, max_r0_block)},
+                num_warps=max(1, threads // warp_size),
+                num_stages=1,
+            )
+            for x_block, r0_block, threads in candidates
+        ]
+    )
+    if reduction_configs_must_be_pinned(inductor_meta):
+        configs = configs[:1]
+
+    if return_configs:
+        return configs
+
+    # TEMPLATE, as for foreach: no coordinate descent. Without size hints it would
+    # not keep R0_BLOCK under nsplit, and the candidates already cover the space.
+    return cached_autotune(
+        None,
+        configs,
+        triton_meta=triton_meta,
+        inductor_meta=inductor_meta,
+        heuristic_type=HeuristicType.TEMPLATE,
+        filename=filename,
     )
 
 

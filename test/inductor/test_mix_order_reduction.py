@@ -1,5 +1,8 @@
 # Owner(s): ["module: inductor"]
 
+import ast
+import contextlib
+import functools
 import unittest
 from unittest import mock
 from unittest.mock import patch
@@ -8,25 +11,35 @@ import torch
 import torch._inductor.config as inductor_config
 import torch.nn.functional as F
 from torch import nn
-from torch._dynamo.utils import same
+from torch._dynamo.utils import counters, same
 from torch._inductor import metrics, utils
 from torch._inductor.choices import InductorChoices
-from torch._inductor.codegen.triton import FixedTritonConfig
+from torch._inductor.codecache import PyCodeCache
+from torch._inductor.codegen.simd import _MixOrderTritonFinalize
+from torch._inductor.codegen.triton import FixedTritonConfig, TritonKernel
+from torch._inductor.codegen.wrapper import PythonWrapperCodegen
 from torch._inductor.runtime.hints import DeviceProperties
-from torch._inductor.runtime.triton_heuristics import persistent_reduction
+from torch._inductor.runtime.triton_heuristics import (
+    mix_order_finalize,
+    persistent_reduction,
+)
 from torch._inductor.scheduler import MixOrderReduction
 from torch._inductor.test_case import run_tests, TestCase
 from torch._inductor.virtualized import V
 from torch.testing import FileCheck
+from torch.testing._internal.common_cuda import SM90OrLater
 from torch.testing._internal.common_device_type import (
     instantiate_device_type_tests,
     largeTensorTest,
 )
 from torch.testing._internal.common_utils import (
+    DeterministicGuard,
     instantiate_parametrized_tests,
+    OMIT_SKIPPED_TESTS,
     parametrize,
     recover_orig_fp32_precision,
     skipIfXpu,
+    TEST_WITH_ROCM,
     TEST_XPU,
 )
 from torch.testing._internal.common_xpu import PLATFORM_SUPPORTS_FLASH_ATTENTION_XPU
@@ -43,6 +56,32 @@ from torch.utils._triton import (
 HAS_GPU_TMA = has_triton_tma_device() and (
     GPU_TYPE != "cuda" or has_triton_cuda_tma_device()
 )
+
+
+_TRITON_FINALIZE_CONFIG = {
+    "split_reductions": False,
+    "triton.cooperative_reductions": False,
+    "triton.force_cooperative_reductions": False,
+    "triton.mix_order_reduction": True,
+    "triton.mix_order_reduction_triton_finalize": True,
+}
+
+
+_TRITON_FINALIZE_KERNEL = "'kernel_name': 'triton_red_mix_order_finalize_"
+
+
+def _pdl_epilogue_graph(x, w):
+    # A consumer of the finalized column sum, in its own kernel. One output, for
+    # utils.get_code.
+    rows = x.sum(dim=1)
+    return (x.sum(dim=0) * (w * 2) + rows[: w.numel()]).to(torch.bfloat16)
+
+
+def _run_and_get_triton_finalize_source(fn, *args):
+    """Runs `fn` and returns its result and the one generated finalize kernel."""
+    result, kernels = utils.run_and_get_kernels(fn, *args, remove_quote=True)
+    (src,) = {src for src in kernels if _TRITON_FINALIZE_KERNEL in src}
+    return result, src
 
 
 class TestBase(TestCase):
@@ -1048,7 +1087,10 @@ class MixOrderReductionTest(TestBase):
         self.assertEqual(metrics.codegen_mix_order_reduction, 1)
         # the slice grads alias the shared cat buffer: the final reduction
         # must be written through the view, never bound to a fresh tensor
-        FileCheck().check(".copy_(workspace_").run(wrapper)
+        if inductor_config.triton.mix_order_reduction_triton_finalize:
+            FileCheck().check(".run(workspace_").run(wrapper)
+        else:
+            FileCheck().check(".copy_(workspace_").run(wrapper)
         self.assertNotIn("= workspace_", wrapper)
         torch.testing.assert_close(ref_grad, act_grad, atol=1e-4, rtol=1e-4)
 
@@ -1848,6 +1890,182 @@ class MixOrderReductionNumericTest(TestBase):
         self.assertNotIn("'tma_min_block_sizes':", wrapper)
         self.assertNotIn("host_tma_descriptor_args", wrapper)
 
+    @inductor_config.patch(_TRITON_FINALIZE_CONFIG)
+    def test_triton_finalize_groups_accumulators(self, device):
+        def f(x):
+            y = x.float()
+            return (
+                y.sum(dim=1),
+                x.sum(dim=0),
+                (y * 2).sum(dim=0),
+                x.half().sum(dim=0),
+                (x * 3).sum(dim=0),
+                (y * 4).sum(dim=0),
+            )
+
+        # Integer values keep every fp32 partial sum exact, so each output must
+        # match eager bit for bit after its own cast.
+        x = torch.randint(-4, 5, (40960, 128), device=device).bfloat16()
+        expected = f(x)
+        counters.clear()
+        actual, (wrapper,) = utils.run_and_get_code(torch.compile(f), x)
+
+        self.assertEqual(metrics.codegen_mix_order_reduction, 1)
+        # Five column accumulators need two launches of at most four outputs.
+        self.assertEqual(counters["inductor"]["mix_order_triton_finalize"], 2)
+        FileCheck().check_count(".run(workspace_", 2, exactly=True).run(wrapper)
+        self.assertEqual(wrapper.count(_TRITON_FINALIZE_KERNEL), 2)
+        self.assertNotIn(".sum(dim=0)", wrapper)
+        for act, ref in zip(actual, expected):
+            self.assertEqual(act, ref, atol=0, rtol=0)
+
+    @inductor_config.patch(_TRITON_FINALIZE_CONFIG)
+    def test_triton_finalize_falls_back_above_max_nsplit(self, device):
+        def f(x):
+            return x.sum(dim=1), x.sum(dim=0)
+
+        x = torch.randint(-4, 5, (40960, 128), device=device).float()
+        counters.clear()
+        with mock.patch.object(_MixOrderTritonFinalize, "max_nsplit", 1):
+            actual, (wrapper,) = utils.run_and_get_code(torch.compile(f), x)
+
+        self.assertEqual(metrics.codegen_mix_order_reduction, 1)
+        self.assertEqual(counters["inductor"]["mix_order_triton_finalize"], 0)
+        self.assertNotIn(".run(workspace_", wrapper)
+        self.assertIn(".sum(dim=0)", wrapper)
+        self.assertEqual(actual, f(x), atol=0, rtol=0)
+
+    @inductor_config.patch(_TRITON_FINALIZE_CONFIG)
+    def test_triton_finalize_pdl_codegen(self, device):
+        # Codegen only, with PDL forced on, so that it runs before sm90 too.
+        x = torch.randint(-4, 5, (40960, 128), device=device).float()
+        w = torch.randn(128, device=device)
+        with mock.patch.object(
+            TritonKernel, "_enable_pdl_codegen", staticmethod(lambda: True)
+        ):
+            code = "\n".join(utils.get_code(torch.compile(_pdl_epilogue_graph), x, w))
+
+        marker = code.index(_TRITON_FINALIZE_KERNEL)
+        start = code.rindex("@triton_heuristics", 0, marker)
+        src = code[start : code.find("# kernel path:", marker)]
+        self.assertIn("'launch_pdl': True", src)
+        # Wait for the workspace, but never let the epilogue start early.
+        FileCheck().check("tl.extra.cuda.gdc_wait()").check("tl.load(").run(src)
+        self.assertNotIn("gdc_launch_dependents", src)
+
+    @parametrize(
+        "mode", ("default", "deterministic", "deterministic_algorithms", "max_autotune")
+    )
+    @inductor_config.patch(
+        {**_TRITON_FINALIZE_CONFIG, "triton.mix_order_reduction_split_size": 128}
+    )
+    def test_triton_finalize_autotune_configs(self, device, mode):
+        def f(x):
+            return x.sum(dim=1), x.sum(dim=0)
+
+        x = torch.randint(-4, 5, (40960, 128), device=device).float()
+        options = {mode: True} if mode in ("deterministic", "max_autotune") else {}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(inductor_config.patch(options))
+            if mode == "deterministic_algorithms":
+                # use_deterministic_algorithms() also writes config.deterministic.
+                # Restore it afterwards, and clear it inside, so that only
+                # are_deterministic_algorithms_enabled pins the configs.
+                stack.enter_context(
+                    inductor_config.patch(deterministic=inductor_config.deterministic)
+                )
+                stack.enter_context(DeterministicGuard(True))
+                stack.enter_context(inductor_config.patch(deterministic=False))
+            actual, src = _run_and_get_triton_finalize_source(torch.compile(f), x)
+
+        # Rebuild the configs that the kernel's decorator autotunes over.
+        (decorator,) = [
+            node
+            for node in ast.walk(ast.parse(src))
+            if isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "triton_heuristics.mix_order_finalize"
+        ]
+        kwargs = {
+            kw.arg: ast.literal_eval(kw.value)
+            for kw in decorator.keywords
+            if kw.arg in ("size_hints", "num_outputs", "inductor_meta")
+        }
+        if mode == "deterministic_algorithms":
+            meta = kwargs["inductor_meta"]
+            self.assertFalse(meta["deterministic"])
+            self.assertTrue(meta["are_deterministic_algorithms_enabled"])
+        configs = mix_order_finalize(
+            **kwargs,
+            triton_meta={"device": DeviceProperties.create(x.device)},
+            return_configs=True,
+        )
+        num_configs = {
+            "default": 4,
+            "deterministic": 1,
+            "deterministic_algorithms": 1,
+            "max_autotune": 8,
+        }[mode]
+        self.assertEqual(len(configs), num_configs)
+        self.assertEqual(configs[0].kwargs, {"XBLOCK": 8, "R0_BLOCK": 128})
+        self.assertEqual(actual, f(x), atol=0, rtol=0)
+
+    @unittest.skipIf(not SM90OrLater or TEST_WITH_ROCM, "PDL requires NVIDIA sm90+")
+    @inductor_config.patch({**_TRITON_FINALIZE_CONFIG, "triton.enable_pdl": True})
+    def test_triton_finalize_under_pdl(self, device):
+        x = torch.randint(-4, 5, (40960, 128), device=device).float()
+        w = torch.randn(128, device=device)
+        actual, src = _run_and_get_triton_finalize_source(
+            torch.compile(_pdl_epilogue_graph), x, w
+        )
+
+        self.assertIn("'launch_pdl': True", src)
+        self.assertNotIn("gdc_launch_dependents", src)
+        self.assertEqual(actual, _pdl_epilogue_graph(x, w))
+
+    @parametrize("dynamic", (False, True))
+    @inductor_config.patch(
+        {**_TRITON_FINALIZE_CONFIG, "triton.autotune_at_compile_time": True}
+    )
+    def test_triton_finalize_autotune_at_compile_time(self, device, dynamic):
+        def f(x):
+            y = x.float()
+            return y.sum(dim=1), x.sum(dim=0), (y * 2).sum(dim=0)
+
+        x = torch.randint(-4, 5, (40960, 128), device=device).bfloat16()
+        if dynamic:
+            torch._dynamo.mark_dynamic(x, 0)
+        autotune_calls = []
+        run_autotune_block = PythonWrapperCodegen.generate_and_run_autotune_block
+
+        def record_autotune_block(wrapper):
+            autotune_calls.append(wrapper.kernel_autotune_calls.getvalue())
+            return run_autotune_block(wrapper)
+
+        with mock.patch.object(
+            PythonWrapperCodegen,
+            "generate_and_run_autotune_block",
+            record_autotune_block,
+        ):
+            actual = torch.compile(f)(x)
+
+        self.assertRegex(
+            "".join(autotune_calls), r"triton_red_mix_order_finalize_\w+\.run\("
+        )
+        self.assertEqual(actual, f(x), atol=0, rtol=0)
+
+    @inductor_config.patch({**_TRITON_FINALIZE_CONFIG, "benchmark_kernel": True})
+    def test_triton_finalize_benchmark_harness(self, device):
+        def f(x):
+            return x.sum(dim=1), x.sum(dim=0)
+
+        x = torch.randint(-4, 5, (40960, 128), device=device).float()
+        actual, src = _run_and_get_triton_finalize_source(torch.compile(f), x)
+
+        self.assertIn("'kernel_num_gb':", src)
+        mod = PyCodeCache.load(src)
+        mod.call(mod.get_args())
+        self.assertEqual(actual, f(x), atol=0, rtol=0)
+
 
 instantiate_device_type_tests(
     MixOrderReductionNumericTest,
@@ -1892,6 +2110,41 @@ class MixOrderReductionHeuristicTest(TestBase):
         self.assertTrue(configs, "expected at least one config")
         return {c.kwargs["NUM_STAGES"] for c in configs}
 
+    def test_mix_order_finalize_configs(self):
+        def configs(inductor_meta, x=128, r0=320, num_outputs=1, warp_size=32):
+            device = DeviceProperties(
+                type="cpu", index=0, multi_processor_count=1, cc=0, warp_size=warp_size
+            )
+            return [
+                (c.kwargs["XBLOCK"], c.kwargs["R0_BLOCK"], c.num_warps)
+                for c in mix_order_finalize(
+                    {"x": x, "r0": r0},
+                    num_outputs,
+                    triton_meta={"device": device},
+                    inductor_meta=inductor_meta,
+                    return_configs=True,
+                )
+            ]
+
+        regular = [(8, 128, 8), (8, 64, 8), (16, 64, 8), (16, 512, 4)]
+        self.assertEqual(configs({}), regular)
+        # Any signal that reductions must be deterministic keeps only the default.
+        for key in (
+            "deterministic",
+            "force_filter_reduction_configs",
+            "are_deterministic_algorithms_enabled",
+        ):
+            self.assertEqual(configs({key: True}), regular[:1])
+        extra = [(16, 64, 4), (8, 64, 4), (8, 512, 8), (8, 256, 8)]
+        for key in ("max_autotune", "max_autotune_pointwise"):
+            self.assertEqual(configs({key: True}), regular + extra)
+        # Wide outputs change the default; R0_BLOCK stops at next_power_of_2(r0).
+        self.assertEqual(
+            configs({}, x=4096, r0=100, num_outputs=4),
+            [(16, 64, 8), (8, 64, 8), (16, 128, 4)],
+        )
+        self.assertEqual(configs({}, warp_size=64)[0], (8, 128, 4))
+
     def test_num_stages_support_matrix(self):
         cases = (
             ("no TMA", False, False, {3}),
@@ -1933,6 +2186,67 @@ class MixOrderReductionHeuristicTest(TestBase):
 )
 class NoMixOrderReductionTest(MixOrderReductionTest):
     pass
+
+
+@inductor_config.patch(
+    {
+        "triton.cooperative_reductions": False,
+        "triton.force_cooperative_reductions": False,
+        "triton.mix_order_reduction": True,
+        "triton.mix_order_reduction_triton_finalize": True,
+    }
+)
+class MixOrderReductionTritonFinalizeTest(TestBase):
+    pass
+
+
+def _expect_triton_finalize(test):
+    @functools.wraps(test)
+    def wrapper(self):
+        counters.clear()
+        test(self)
+        # Every mix-order reduction finalizes all its column sums in Triton.
+        self.assertGreater(metrics.codegen_mix_order_reduction, 0)
+        self.assertGreaterEqual(
+            counters["inductor"]["mix_order_triton_finalize"],
+            metrics.codegen_mix_order_reduction,
+        )
+        self.assertEqual(counters["inductor"]["mix_order_aten_finalize"], 0)
+
+    return wrapper
+
+
+# MixOrderReductionTest cases whose column sums reach the Triton finalizer.
+_TRITON_FINALIZE_CASES = (
+    "test_mix_order_reduction_name_sum",
+    "test_non_contiguous_input",
+    "test_multi_workspace_allocation",
+    "test_rms_norm_bwd_tma_small",
+    "test_layer_norm_bwd_with_bias",
+    "test_rms_norm_bwd_with_dynamic_shape",
+    "test_layer_norm_bwd_with_dynamic_shape",
+    "test_layer_norm_bwd_no_bias",
+    "test_rms_norm_sharing_weights",
+    "test_layer_norm_sharing_weights",
+    "test_chained_modulated_norm_shared_table",
+)
+_matched_cases = set()
+for _name in dir(MixOrderReductionTest):
+    for _case in _TRITON_FINALIZE_CASES:
+        if _name == _case or _name.startswith(f"{_case}_"):
+            _matched_cases.add(_case)
+            setattr(
+                MixOrderReductionTritonFinalizeTest,
+                _name,
+                _expect_triton_finalize(getattr(MixOrderReductionTest, _name)),
+            )
+# PYTORCH_TEST_OMIT_SKIPPED=1 deletes skipped tests, such as the TMA case on a host
+# without TMA, so a missing case is an error only without it.
+if _matched_cases != set(_TRITON_FINALIZE_CASES) and not OMIT_SKIPPED_TESTS:
+    raise AssertionError(
+        f"no MixOrderReductionTest cases match "
+        f"{sorted(set(_TRITON_FINALIZE_CASES) - _matched_cases)}"
+    )
 
 
 if __name__ == "__main__":

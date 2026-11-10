@@ -115,6 +115,7 @@ from .common import (
     IndentedBuffer,
     InplacedBuffer,
     is_buffer_removed,
+    KernelArgType,
     OpOverrides,
     PythonPrinter,
     RemovedArg,
@@ -7775,9 +7776,24 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         Returns:
             IndentedBuffer: A buffer containing the generated Python benchmark code.
         """
-        result = IndentedBuffer()
         _argdefs, call_args, signature, _ = self.args.python_argdefs()
+        return self.codegen_benchmark_harness(
+            call_args, signature, self.kernel_benchmark_extra_args(), num_gb
+        )
 
+    def codegen_benchmark_harness(
+        self,
+        call_args: Sequence[Any],
+        signature: Sequence[KernelArgType],
+        extra_args: list[str],
+        num_gb: float | None,
+    ) -> IndentedBuffer:
+        """
+        Generates the benchmark harness of codegen_kernel_benchmark for a kernel
+        with the given call arguments and signature. `extra_args` are appended to
+        the generated `get_args()` result.
+        """
+        result = IndentedBuffer()
         result.writelines(["", "", "def get_args():"])
         with result.indent():
             name_cnt = itertools.count()
@@ -7836,7 +7852,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                         f"Don't find the buffer or const tensor for {arg_name}"
                     )
                 var_names.append(var_name)
-            var_names.extend(self.kernel_benchmark_extra_args())
+            var_names.extend(extra_args)
             result.writeline(f"return {', '.join(var_names)},")
 
         result.writelines(["\n", "\n", "def call(args):"])
@@ -9256,7 +9272,9 @@ class TritonScheduling(SIMDScheduling):
             ),
         )
 
-    def define_kernel(self, src_code, node_schedule, kernel):
+    def define_kernel(
+        self, src_code, node_schedule, kernel, *, name_prefix: str | None = None
+    ):
         wrapper = V.graph.wrapper_code
         if src_code in wrapper.src_to_kernel:
             kernel_name = wrapper.src_to_kernel[src_code]
@@ -9268,9 +9286,11 @@ class TritonScheduling(SIMDScheduling):
             )
             if fused_name:
                 fused_name = V.choices.customize_fused_kernel_name(fused_name, src_code)
-            kernel_category = get_kernel_category_by_source_code(src_code)[:3]
+            if name_prefix is None:
+                kernel_category = get_kernel_category_by_source_code(src_code)[:3]
+                name_prefix = f"triton_{kernel_category}"
             kernel_name = "_".join(
-                ["triton", kernel_category, fused_name, wrapper.next_kernel_suffix()]
+                [name_prefix, fused_name, wrapper.next_kernel_suffix()]
             )
             if config.aot_inductor.model_name_for_generated_files:
                 # When AOTI compiles multiple submodules, we need to use the model name to
