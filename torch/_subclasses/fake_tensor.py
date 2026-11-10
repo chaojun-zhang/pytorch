@@ -2102,10 +2102,11 @@ class FakeTensorMode(TorchDispatchMode):
             prev_only_lift_cpu_tensors = torch._C._only_lift_cpu_tensors()
             torch._C._set_only_lift_cpu_tensors(True)
 
-            # In the case of CPU-only build or cuda device unavailable,
-            # we patch the cuda device guard to use NoOpDeviceGuardImpl.
-            # This enables us to trace over cuda kernels under FakeTensorMode.
+            # In the case of a CUDA/XPU build with no device available, we
+            # patch the device guard to use FakeGuardImpl. This enables us to
+            # trace over device kernels under FakeTensorMode.
             torch._C._ensureCUDADeviceGuardSet()
+            torch._C._ensureXPUDeviceGuardSet()
 
         maybe_prev_fake_mode = torch._C._unset_dispatch_mode(self._mode_key)
         if self is not maybe_prev_fake_mode:
