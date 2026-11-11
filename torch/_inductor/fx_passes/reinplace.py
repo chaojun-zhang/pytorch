@@ -248,7 +248,7 @@ def should_reinplace_scatter(node: torch.fx.Node) -> bool:
     Reinplacing view scatter ops can be pessimising as it blocks fusion with the
     input or output tensor computations. However, it is still profitable if the
     input and output would have been realized anyway.
-
+    config.reinplace_whenever_possible overrides profitability, but not safety.
     """
     inp, src, _view_ops = node.args
 
@@ -274,16 +274,17 @@ def should_reinplace_scatter(node: torch.fx.Node) -> bool:
     ):
         return True
 
-    # Otherwise, assume fusions will make functional variants profitable
-    return False
+    # Otherwise, prefer functional variants for fusion unless explicitly overridden.
+    return config.reinplace_whenever_possible
 
 
 def should_reinplace_all_reduce(node: torch.fx.Node) -> bool:
     """
     The symmetric-memory one-shot all-reduce lowering is out-of-place, so
     reinplacing an all_reduce it may pick only adds a copy back into the input.
+    config.reinplace_whenever_possible accepts that cost after safety checks.
     """
-    if not config._collective.auto_select:
+    if config.reinplace_whenever_possible or not config._collective.auto_select:
         return True
     from torch.distributed._symmetric_memory import is_symm_mem_enabled_for_group
 
@@ -981,7 +982,10 @@ def reinplace_inplaceable_ops_core(graph: torch.fx.Graph) -> None:
     for node in graph.nodes:
         previous_hash = fake_tensor_updater.hash_node(node)
         previous_replacements = len(pending_replacements)
-        refresh_after_rewrite = node.target is not _generalized_scatter
+        refresh_after_rewrite = (
+            node.target is not _generalized_scatter
+            or config.reinplace_whenever_possible
+        )
         if (inplaceable_op := inplaceable_ops.get(node.target)) is not None:
             # Check if ALL mutated args can be inplaced
             # Only convert if we don't need to clone any tensor
