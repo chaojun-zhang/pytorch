@@ -14,7 +14,7 @@ import onnx_ir as ir
 
 import torch
 from torch.onnx._internal.exporter._torchlib._torchlib_registry import onnx_impl
-from torch.onnx._internal.exporter._torchlib.ops import common as common_ops
+from torch.onnx._internal.exporter._torchlib.ops import _promotion, common as common_ops
 
 
 if TYPE_CHECKING:
@@ -59,6 +59,7 @@ def aten__local_scalar_dense(op: TranslationContext, self: ir.Value) -> ir.Value
 @onnx_impl(aten.acos.default)
 def aten_acos(op: TranslationContext, self: ir.Value) -> ir.Value:
     """acos(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
 
     return op.Acos(self)
 
@@ -66,6 +67,7 @@ def aten_acos(op: TranslationContext, self: ir.Value) -> ir.Value:
 @onnx_impl(aten.acosh.default)
 def aten_acosh(op: TranslationContext, self: ir.Value) -> ir.Value:
     """acosh(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
 
     return op.Acosh(self)
 
@@ -75,6 +77,7 @@ def aten_add(
     op: TranslationContext, self: ir.Value, other: ir.Value, alpha: float = 1.0
 ) -> ir.Value:
     """add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
 
     if self.dtype == ir.DataType.BOOL:
         # alpha can also be bool
@@ -93,9 +96,8 @@ def aten_add_scalar(
     op: TranslationContext, self: ir.Value, other: float, alpha: float = 1.0
 ) -> ir.Value:
     """add.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor"""
-    builder = op.builder
+    self, other = _promotion.promote(op, self, other)
 
-    other = builder.constant(other, dtype=self.dtype)
     return aten_add(op, self, other, alpha=alpha)
 
 
@@ -112,6 +114,7 @@ def aten_add_complex(
     alpha: float = 1.0,
 ) -> ir.Value:
     """add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor"""
+    self, other = _promotion.promote(op, self, other, packed_complex=True)
     other = common_ops.complex_scalar(op, other, dtype=self.dtype)
     return aten_add(op, self, other, alpha=alpha)
 
@@ -129,6 +132,9 @@ def aten_addcdiv(
     Performs the element-wise division of tensor1 by tensor2, multiplies the result
     by the scalar value and adds it to self.
     """
+    self, tensor1, tensor2 = _promotion.promote(
+        op, self, tensor1, tensor2, kind="INT_TO_FLOAT"
+    )
 
     return op.Add(
         self,
@@ -149,6 +155,7 @@ def aten_addcmul(
     Performs the element-wise multiplication of tensor1 by tensor2, multiplies the
     result by the scalar value and adds it to self.
     """
+    self, tensor1, tensor2 = _promotion.promote(op, self, tensor1, tensor2)
 
     # Follow the order in https://github.com/pytorch/pytorch/blob/29e3fddb082b5a14262a7246bc62381a55199d45/aten/src/ATen/native/cpu/PointwiseOpsKernel.cpp#L47
     # TODO(#811): Understand fp16 accuracy issue
@@ -190,6 +197,7 @@ def aten_angle_complex(op: TranslationContext, self: ir.Value) -> ir.Value:
 @onnx_impl(aten.asin.default)
 def aten_asin(op: TranslationContext, self: ir.Value) -> ir.Value:
     """asin(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
 
     return op.Asin(self)
 
@@ -197,6 +205,7 @@ def aten_asin(op: TranslationContext, self: ir.Value) -> ir.Value:
 @onnx_impl(aten.asinh.default)
 def aten_asinh(op: TranslationContext, self: ir.Value) -> ir.Value:
     """asinh(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
 
     return op.Asinh(self)
 
@@ -204,6 +213,7 @@ def aten_asinh(op: TranslationContext, self: ir.Value) -> ir.Value:
 @onnx_impl(aten.atan.default)
 def aten_atan(op: TranslationContext, self: ir.Value) -> ir.Value:
     """atan(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
 
     return op.Atan(self)
 
@@ -211,6 +221,7 @@ def aten_atan(op: TranslationContext, self: ir.Value) -> ir.Value:
 @onnx_impl(aten.atan2.default)
 def aten_atan2(op: TranslationContext, self: ir.Value, other: ir.Value) -> ir.Value:
     """atan2(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other, kind="INT_TO_FLOAT")
     return _atan2(op, self, other, dtype=self.dtype)
 
 
@@ -238,6 +249,7 @@ def _atan2(
 @onnx_impl(aten.atanh.default)
 def aten_atanh(op: TranslationContext, self: ir.Value) -> ir.Value:
     """atanh(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
 
     return op.Atanh(self)
 
@@ -247,6 +259,7 @@ def aten_bitwise_and(
     op: TranslationContext, self: ir.Value, other: ir.Value
 ) -> ir.Value:
     """bitwise_and.Tensor(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
 
     if not (self.dtype == other.dtype or self.dtype is None or other.dtype is None):
         raise ValueError(
@@ -272,9 +285,9 @@ def aten_bitwise_and_scalar(
     op: TranslationContext, self: ir.Value, other: int
 ) -> ir.Value:
     """bitwise_and.Scalar(Tensor self, Scalar other) -> Tensor"""
-    builder = op.builder
+    self, other = _promotion.promote(op, self, other)
 
-    other_tensor = builder.constant(other, dtype=self.dtype)
+    other_tensor = other
     return aten_bitwise_and(op, self, other_tensor)
 
 
@@ -283,9 +296,9 @@ def aten_bitwise_and_scalar_tensor(
     op: TranslationContext, self: float, other: ir.Value
 ) -> ir.Value:
     """bitwise_and.Scalar_Tensor(Scalar self, Tensor other) -> Tensor"""
-    builder = op.builder
+    self, other = _promotion.promote(op, self, other)
 
-    self_tensor = builder.constant(self, dtype=other.dtype)
+    self_tensor = self
     return aten_bitwise_and(op, self_tensor, other)
 
 
@@ -294,6 +307,7 @@ def aten_bitwise_left_shift(
     op: TranslationContext, self: ir.Value, other: ir.Value
 ) -> ir.Value:
     """bitwise_left_shift.Tensor(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
     if not (self.dtype == other.dtype or self.dtype is None or other.dtype is None):
         raise ValueError(
             f"aten_bitwise_left_shift requires matching tensor dtypes, got {self.dtype} and {other.dtype}. Cast operands to the same dtype before translation."
@@ -338,8 +352,8 @@ def aten_bitwise_left_shift_tensor_scalar(
     op: TranslationContext, self: ir.Value, other: int
 ) -> ir.Value:
     """bitwise_left_shift.Tensor_Scalar(Tensor self, Scalar other) -> Tensor"""
-    builder = op.builder
-    other_tensor = builder.constant(other, dtype=self.dtype)
+    self, other = _promotion.promote(op, self, other)
+    other_tensor = other
     return aten_bitwise_left_shift(op, self, other_tensor)
 
 
@@ -348,8 +362,8 @@ def aten_bitwise_left_shift_scalar_tensor(
     op: TranslationContext, self: int, other: ir.Value
 ) -> ir.Value:
     """bitwise_left_shift.Scalar_Tensor(Scalar self, Tensor other) -> Tensor"""
-    builder = op.builder
-    self_tensor = builder.constant(self, dtype=other.dtype)
+    self, other = _promotion.promote(op, self, other)
+    self_tensor = self
     return aten_bitwise_left_shift(op, self_tensor, other)
 
 
@@ -371,6 +385,7 @@ def aten_bitwise_or(
     op: TranslationContext, self: ir.Value, other: ir.Value
 ) -> ir.Value:
     """bitwise_or.Tensor(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
 
     if not (self.dtype == other.dtype or self.dtype is None or other.dtype is None):
         raise ValueError(
@@ -396,8 +411,8 @@ def aten_bitwise_or_scalar(
     op: TranslationContext, self: ir.Value, other: int
 ) -> ir.Value:
     """bitwise_or.Scalar(Tensor self, Scalar other) -> Tensor"""
-    builder = op.builder
-    other_tensor = builder.constant(other, dtype=self.dtype)
+    self, other = _promotion.promote(op, self, other)
+    other_tensor = other
     return aten_bitwise_or(op, self, other_tensor)
 
 
@@ -406,8 +421,8 @@ def aten_bitwise_or_scalar_tensor(
     op: TranslationContext, self: int, other: ir.Value
 ) -> ir.Value:
     """bitwise_or.Scalar_Tensor(Scalar self, Tensor other) -> Tensor"""
-    builder = op.builder
-    self_tensor = builder.constant(self, dtype=other.dtype)
+    self, other = _promotion.promote(op, self, other)
+    self_tensor = self
     return aten_bitwise_or(op, self_tensor, other)
 
 
@@ -416,6 +431,7 @@ def aten_bitwise_right_shift(
     op: TranslationContext, self: ir.Value, other: ir.Value
 ) -> ir.Value:
     """bitwise_right_shift.Tensor(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
     builder = op.builder
     if not (self.dtype == other.dtype or self.dtype is None or other.dtype is None):
         raise ValueError(
@@ -478,8 +494,8 @@ def aten_bitwise_right_shift_tensor_scalar(
     op: TranslationContext, self: ir.Value, other: int
 ) -> ir.Value:
     """bitwise_right_shift.Tensor_Scalar(Tensor self, Scalar other) -> Tensor"""
-    builder = op.builder
-    other_tensor = builder.constant(other, dtype=self.dtype)
+    self, other = _promotion.promote(op, self, other)
+    other_tensor = other
     return aten_bitwise_right_shift(op, self, other_tensor)
 
 
@@ -488,8 +504,8 @@ def aten_bitwise_right_shift_scalar_tensor(
     op: TranslationContext, self: int, other: ir.Value
 ) -> ir.Value:
     """bitwise_right_shift.Scalar_Tensor(Scalar self, Tensor other) -> Tensor"""
-    builder = op.builder
-    self_tensor = builder.constant(self, dtype=other.dtype)
+    self, other = _promotion.promote(op, self, other)
+    self_tensor = self
     return aten_bitwise_right_shift(op, self_tensor, other)
 
 
@@ -498,6 +514,7 @@ def aten_bitwise_xor(
     op: TranslationContext, self: ir.Value, other: ir.Value
 ) -> ir.Value:
     """bitwise_xor.Tensor(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
 
     if not (self.dtype == other.dtype or self.dtype is None or other.dtype is None):
         raise ValueError(
@@ -523,8 +540,8 @@ def aten_bitwise_xor_scalar(
     op: TranslationContext, self: ir.Value, other: int
 ) -> ir.Value:
     """bitwise_xor.Scalar(Tensor self, Scalar other) -> Tensor"""
-    builder = op.builder
-    other_tensor = builder.constant(other, dtype=self.dtype)
+    self, other = _promotion.promote(op, self, other)
+    other_tensor = other
     return aten_bitwise_xor(op, self, other_tensor)
 
 
@@ -533,8 +550,8 @@ def aten_bitwise_xor_scalar_tensor(
     op: TranslationContext, self: int, other: ir.Value
 ) -> ir.Value:
     """bitwise_xor.Scalar_Tensor(Scalar self, Tensor other) -> Tensor"""
-    builder = op.builder
-    self_tensor = builder.constant(self, dtype=other.dtype)
+    self, other = _promotion.promote(op, self, other)
+    self_tensor = self
     return aten_bitwise_xor(op, self_tensor, other)
 
 
@@ -560,6 +577,12 @@ def aten_clamp(
     max: float | None = None,
 ) -> ir.Value:
     """clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor"""
+    promoted_dtype = _promotion.dtypes(op, self, min, max)[1]
+    self = _promotion.cast(op, self, promoted_dtype)
+    if min is not None:
+        min = _promotion.cast(op, min, promoted_dtype)
+    if max is not None:
+        max = _promotion.cast(op, max, promoted_dtype)
 
     if min is None and max is None:
         return op.Identity(self)
@@ -581,6 +604,12 @@ def aten_clamp_tensor(
     max: ir.Value | None = None,
 ) -> ir.Value:
     """clamp.Tensor(Tensor self, Tensor? min=None, Tensor? max=None) -> Tensor"""
+    promoted_dtype = _promotion.dtypes(op, self, min, max)[1]
+    self = _promotion.cast(op, self, promoted_dtype)
+    if min is not None:
+        min = _promotion.cast(op, min, promoted_dtype)
+    if max is not None:
+        max = _promotion.cast(op, max, promoted_dtype)
 
     if min is None and max is None:
         return op.Identity(self)
@@ -604,6 +633,7 @@ def aten_clamp_tensor(
 @onnx_impl(aten.clamp_max.default)
 def aten_clamp_max(op: TranslationContext, self: ir.Value, max_: float) -> ir.Value:
     """clamp_max(Tensor self, Scalar max) -> Tensor"""
+    self, max_ = _promotion.promote(op, self, max_)
 
     # This implementation does not intend to handle when self is an empty tensor
     max_ = op.CastLike(max_, self)
@@ -615,6 +645,7 @@ def aten_clamp_max_tensor(
     op: TranslationContext, self: ir.Value, max_: ir.Value
 ) -> ir.Value:
     """clamp_max.Tensor(Tensor self, Tensor max) -> Tensor"""
+    self, max_ = _promotion.promote(op, self, max_)
 
     # This implementation does not intend to handle when self is an empty tensor
     max_rank = len(max_.shape)
@@ -630,6 +661,7 @@ def aten_clamp_max_tensor(
 @onnx_impl(aten.clamp_min.default)
 def aten_clamp_min(op: TranslationContext, self: ir.Value, min_: float) -> ir.Value:
     """clamp_min(Tensor self, Scalar min) -> Tensor"""
+    self, min_ = _promotion.promote(op, self, min_)
 
     # This implementation does not intend to handle when self is an empty tensor
     min_ = op.CastLike(min_, self)
@@ -641,6 +673,7 @@ def aten_clamp_min_tensor(
     op: TranslationContext, self: ir.Value, min_: ir.Value
 ) -> ir.Value:
     """clamp_min.Tensor(Tensor self, Tensor min) -> Tensor"""
+    self, min_ = _promotion.promote(op, self, min_)
 
     # This implementation does not intend to handle when self is an empty tensor
     min_rank = len(min_.shape)
@@ -724,6 +757,7 @@ def aten__to_copy(
 @onnx_impl(aten.cos.default)
 def aten_cos(op: TranslationContext, self: ir.Value) -> ir.Value:
     """cos(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
 
     return op.Cos(self)
 
@@ -731,6 +765,7 @@ def aten_cos(op: TranslationContext, self: ir.Value) -> ir.Value:
 @onnx_impl(aten.cosh.default)
 def aten_cosh(op: TranslationContext, self: ir.Value) -> ir.Value:
     """cosh(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
 
     return op.Cosh(self)
 
@@ -738,6 +773,7 @@ def aten_cosh(op: TranslationContext, self: ir.Value) -> ir.Value:
 @onnx_impl(aten.deg2rad.default)
 def aten_deg2rad(op: TranslationContext, self: ir.Value) -> ir.Value:
     """deg2rad(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
 
     return op.Mul(self, op.CastLike(math.pi / 180.0, self))
 
@@ -754,6 +790,7 @@ def aten_deg2rad(op: TranslationContext, self: ir.Value) -> ir.Value:
 )
 def aten_div(op: TranslationContext, self: ir.Value, other: ir.Value) -> ir.Value:
     """div.Tensor(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other, kind="INT_TO_FLOAT")
 
     # Int inputs will be promoted to float by PyTorch
     return op.Div(self, other)
@@ -786,6 +823,9 @@ def aten_div_complex(
     other: ir.Value | complex | float | int | bool,
 ) -> ir.Value:
     """div.Tensor(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(
+        op, self, other, kind="INT_TO_FLOAT", packed_complex=True
+    )
     other = common_ops.complex_scalar(op, other, dtype=self.dtype)
 
     # Complex division. PyTorch type promotion ensures both arguments are complex numbers
@@ -819,6 +859,9 @@ def aten_div_mode(
     rounding_mode: str | None = None,
 ) -> ir.Value:
     """div.Tensor_mode(Tensor self, Tensor other, *, str? rounding_mode) -> Tensor"""
+    self, other = _promotion.promote(
+        op, self, other, kind="INT_TO_FLOAT" if rounding_mode is None else "DEFAULT"
+    )
 
     if rounding_mode not in {"trunc", "floor", None}:
         raise ValueError(
@@ -865,6 +908,7 @@ def aten_div_mode(
 @onnx_impl((aten.eq.default, aten.eq.Tensor, aten.eq.Scalar, operator.eq))
 def aten_eq(op: TranslationContext, self: ir.Value, other: ir.Value) -> ir.Value:
     """eq.Tensor(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
 
     return op.Equal(self, other)
 
@@ -872,6 +916,7 @@ def aten_eq(op: TranslationContext, self: ir.Value, other: ir.Value) -> ir.Value
 @onnx_impl(aten.exp.default)
 def aten_exp(op: TranslationContext, self: ir.Value) -> ir.Value:
     """exp(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
 
     return op.Exp(self)
 
@@ -879,6 +924,7 @@ def aten_exp(op: TranslationContext, self: ir.Value) -> ir.Value:
 @onnx_impl(aten.exp2.default)
 def aten_exp2(op: TranslationContext, self: ir.Value) -> ir.Value:
     """exp2(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
     builder = op.builder
 
     two = builder.constant(2, dtype=ir.DataType.INT64)
@@ -905,6 +951,7 @@ def aten_floor_divide(
     op: TranslationContext, self: ir.Value, other: ir.Value
 ) -> ir.Value:
     """floor_divide(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
 
     if self.dtype.is_floating_point():
         return op.Floor(op.Div(self, other))
@@ -948,6 +995,7 @@ def operator_floordiv(
 @onnx_impl((aten.fmod.Tensor, aten.fmod.Scalar))
 def aten_fmod(op: TranslationContext, self: ir.Value, other: ir.Value) -> ir.Value:
     """fmod.Tensor(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
 
     return op.Mod(self, other, fmod=1)
 
@@ -972,6 +1020,7 @@ def aten_frac(op: TranslationContext, self: ir.Value) -> ir.Value:
 @onnx_impl((aten.ge.Tensor, aten.ge.Scalar, aten.greater_equal.Tensor))
 def aten_ge(op: TranslationContext, self: ir.Value, other: ir.Value) -> ir.Value:
     """ge.Tensor(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
 
     if self.dtype == ir.DataType.BOOL:
         # self, other, self >= other
@@ -993,6 +1042,7 @@ def operator_ge(op: TranslationContext, self: ir.Value, other: ir.Value) -> ir.V
 @onnx_impl((aten.gt.Tensor, aten.gt.Scalar, aten.greater.Tensor))
 def aten_gt(op: TranslationContext, self: ir.Value, other: ir.Value) -> ir.Value:
     """gt.Tensor(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
 
     if self.dtype == ir.DataType.BOOL:
         # self, other, self > other
@@ -1115,6 +1165,7 @@ def aten_isposinf(op: TranslationContext, self: ir.Value) -> ir.Value:
 @onnx_impl((aten.le.Tensor, aten.le.Scalar, aten.less_equal.Tensor))
 def aten_le(op: TranslationContext, self: ir.Value, other: ir.Value) -> ir.Value:
     """le.Tensor(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
 
     if self.dtype == ir.DataType.BOOL:
         # self, other, self <= other
@@ -1139,6 +1190,7 @@ def aten_lerp(
     op: TranslationContext, self: ir.Value, end: ir.Value, weight: ir.Value
 ) -> ir.Value:
     """lerp.Tensor(Tensor self, Tensor end, Tensor weight) -> Tensor"""
+    self, end, weight = _promotion.promote(op, self, end, weight)
 
     weight = op.CastLike(weight, self)
     diff = op.Sub(end, self)
@@ -1155,6 +1207,7 @@ def aten_lerp(
 @onnx_impl(aten.log.default)
 def aten_log(op: TranslationContext, self: ir.Value) -> ir.Value:
     """log(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
 
     return op.Log(self)
 
@@ -1162,6 +1215,7 @@ def aten_log(op: TranslationContext, self: ir.Value) -> ir.Value:
 @onnx_impl(aten.log10.default)
 def aten_log10(op: TranslationContext, self: ir.Value) -> ir.Value:
     """log10(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
     builder = op.builder
 
     return op.Div(
@@ -1173,6 +1227,7 @@ def aten_log10(op: TranslationContext, self: ir.Value) -> ir.Value:
 @onnx_impl(aten.log1p.default)
 def aten_log1p(op: TranslationContext, self: ir.Value) -> ir.Value:
     """log1p(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
 
     return op.Log(op.Add(self, 1.0))
 
@@ -1180,6 +1235,7 @@ def aten_log1p(op: TranslationContext, self: ir.Value) -> ir.Value:
 @onnx_impl(aten.log2.default)
 def aten_log2(op: TranslationContext, self: ir.Value) -> ir.Value:
     """log2(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
     builder = op.builder
 
     return op.Div(
@@ -1191,6 +1247,7 @@ def aten_log2(op: TranslationContext, self: ir.Value) -> ir.Value:
 @onnx_impl(aten.logaddexp.default)
 def aten_logaddexp(op: TranslationContext, self: ir.Value, other: ir.Value) -> ir.Value:
     """logaddexp(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
 
     return op.Log(
         op.Add(op.Exp(self), op.Exp(other)),
@@ -1202,6 +1259,7 @@ def aten_logaddexp2(
     op: TranslationContext, self: ir.Value, other: ir.Value
 ) -> ir.Value:
     """logaddexp2(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
     two = op.CastLike(2.0, self)
     summation = op.Add(op.Pow(two, self), op.Pow(two, other))
 
@@ -1213,6 +1271,7 @@ def aten_logical_and(
     op: TranslationContext, self: ir.Value, other: ir.Value
 ) -> ir.Value:
     """logical_and(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
 
     if self.dtype != other.dtype:
         raise ValueError(
@@ -1241,6 +1300,7 @@ def aten_logical_or(
     op: TranslationContext, self: ir.Value, other: ir.Value
 ) -> ir.Value:
     """logical_or(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
 
     if self.dtype != other.dtype:
         raise ValueError(
@@ -1260,6 +1320,7 @@ def aten_logical_xor(
     op: TranslationContext, self: ir.Value, other: ir.Value
 ) -> ir.Value:
     """logical_xor(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
 
     if self.dtype != other.dtype:
         raise ValueError(
@@ -1279,6 +1340,7 @@ def aten_logit(
     op: TranslationContext, self: ir.Value, eps: float | None = None
 ) -> ir.Value:
     """logit(Tensor self, float? eps=None) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
     builder = op.builder
     one = builder.constant(1, dtype=self.dtype)
 
@@ -1302,6 +1364,7 @@ def aten_logit(
 @onnx_impl((aten.lt.Tensor, aten.lt.Scalar, aten.less.Tensor))
 def aten_lt(op: TranslationContext, self: ir.Value, other: ir.Value) -> ir.Value:
     """lt.Tensor(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
 
     if self.dtype == ir.DataType.BOOL:
         # self, other, self < other
@@ -1323,6 +1386,7 @@ def operator_lt(op: TranslationContext, self: ir.Value, other: ir.Value) -> ir.V
 @onnx_impl(aten.maximum.default)
 def aten_maximum(op: TranslationContext, self: ir.Value, other: ir.Value) -> ir.Value:
     """maximum(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
 
     if self.dtype == ir.DataType.BOOL:
         return op.Or(self, other)
@@ -1333,6 +1397,7 @@ def aten_maximum(op: TranslationContext, self: ir.Value, other: ir.Value) -> ir.
 @onnx_impl(aten.minimum.default)
 def aten_minimum(op: TranslationContext, self: ir.Value, other: ir.Value) -> ir.Value:
     """minimum(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
 
     if self.dtype == ir.DataType.BOOL:
         return op.And(self, other)
@@ -1343,6 +1408,7 @@ def aten_minimum(op: TranslationContext, self: ir.Value, other: ir.Value) -> ir.
 @onnx_impl((aten.mul.default, aten.mul.Tensor, aten.multiply.Tensor))
 def aten_mul(op: TranslationContext, self: ir.Value, other: ir.Value) -> ir.Value:
     """mul.Tensor(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
 
     if self.dtype == ir.DataType.BOOL:
         return op.And(self, other)
@@ -1362,6 +1428,7 @@ def aten_mul_complex(
     other: ir.Value | complex | float | int | bool,
 ) -> ir.Value:
     """mul.Tensor(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other, packed_complex=True)
     other = common_ops.complex_scalar(op, other, dtype=self.dtype)
 
     # TODO(justinchuby): Maybe use Split to simplify the logic
@@ -1387,15 +1454,15 @@ def aten_mul_complex(
 @onnx_impl((aten.mul.Scalar, aten.multiply.Scalar))
 def aten_mul_scalar(op: TranslationContext, self: ir.Value, other: float) -> ir.Value:
     """mul.Scalar(Tensor self, Scalar other) -> Tensor"""
-    builder = op.builder
+    self, other = _promotion.promote(op, self, other)
 
-    other = builder.constant(other, dtype=self.dtype)
     return aten_mul(op, self, other)
 
 
 @onnx_impl((aten.ne.default, aten.ne.Scalar, aten.ne.Tensor, operator.ne))
 def aten_ne(op: TranslationContext, self: ir.Value, other: ir.Value) -> ir.Value:
     """ne.Tensor(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
 
     return op.Not(op.Equal(self, other))
 
@@ -1417,6 +1484,7 @@ def aten_neg_complex(op: TranslationContext, self: ir.Value) -> ir.Value:
 @onnx_impl((aten.pow.Tensor_Tensor, operator.pow))
 def aten_pow(op: TranslationContext, self: ir.Value, exponent: ir.Value) -> ir.Value:
     """pow(Tensor self, Tensor exponent) -> Tensor"""
+    self, exponent = _promotion.promote(op, self, exponent, kind="BOOL_TO_LONG")
     # TODO(justinchuby): Add type promotion
     return op.Pow(self, exponent)
 
@@ -1426,20 +1494,7 @@ def aten_pow_tensor_scalar(
     op: TranslationContext, self: ir.Value, exponent: float
 ) -> ir.Value:
     """pow(Tensor self, Scalar exponent) -> Tensor"""
-    builder = op.builder
-    if self.dtype.is_floating_point():
-        # Handle cases when e.g. (1) self is float16 or int
-        return op.Pow(self, builder.constant(exponent, dtype=self.dtype))
-    # For integer types, we need to cast self to the exponent type
-    if isinstance(exponent, int):
-        # The scalar exponent can be an int
-        return op.Pow(self, builder.constant(exponent, dtype=self.dtype))
-
-    # exponent is float so we cast self to match the exponent type.
-    # More precisely if self is float64, we should cast exponent to float64; but
-    # this is uncommon and should be fixed when we create a general type promotion
-    # mechanism for torchlib
-    return op.Pow(op.Cast(self, to=ir.DataType.FLOAT), exponent)
+    return aten_pow(op, self, exponent)
 
 
 @onnx_impl(aten.pow.Scalar)
@@ -1447,29 +1502,13 @@ def aten_pow_scalar(
     op: TranslationContext, self: float, exponent: ir.Value
 ) -> ir.Value:
     """pow.Scalar(Scalar self, Tensor exponent) -> Tensor"""
-    builder = op.builder
-    if not isinstance(self, int) and not exponent.dtype.is_floating_point():
-        # A float scalar outranks an integral exponent, so torch promotes the result to
-        # the default float type instead of narrowing the scalar down to the exponent
-        return op.Pow(
-            builder.constant(self, dtype=ir.DataType.FLOAT),
-            op.Cast(exponent, to=ir.DataType.FLOAT),
-        )
-    if exponent.dtype == ir.DataType.BOOL:
-        # Pow has no boolean inputs, and an int scalar over a boolean exponent
-        # promotes to the default int type in torch
-        return op.Pow(
-            builder.constant(self, dtype=ir.DataType.INT64),
-            op.Cast(exponent, to=ir.DataType.INT64),
-        )
-    # The exponent is in the same or a higher type category than the scalar, so it
-    # decides the result type. e.g. 2.0 ** float16 tensor is float16
-    return op.Pow(builder.constant(self, dtype=exponent.dtype), exponent)
+    return aten_pow(op, self, exponent)
 
 
 @onnx_impl(aten.rad2deg.default)
 def aten_rad2deg(op: TranslationContext, self: ir.Value) -> ir.Value:
     """rad2deg(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
 
     return op.Mul(self, op.CastLike(180.0 / math.pi, self))
 
@@ -1477,6 +1516,7 @@ def aten_rad2deg(op: TranslationContext, self: ir.Value) -> ir.Value:
 @onnx_impl(aten.reciprocal.default)
 def aten_reciprocal(op: TranslationContext, self: ir.Value) -> ir.Value:
     """reciprocal(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
 
     return op.Reciprocal(self)
 
@@ -1484,6 +1524,7 @@ def aten_reciprocal(op: TranslationContext, self: ir.Value) -> ir.Value:
 @onnx_impl(aten.reciprocal.default, complex=True)
 def aten_reciprocal_complex(op: TranslationContext, self: ir.Value) -> ir.Value:
     """reciprocal(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT", packed_complex=True)
 
     self_real = op.Slice(self, [0], [1], [-1])
     self_imag = op.Slice(self, [1], [2], [-1])
@@ -1518,6 +1559,7 @@ def _aten_remainder(
 @onnx_impl((aten.remainder.Tensor, prims.remainder.default))
 def aten_remainder(op: TranslationContext, self: ir.Value, other: ir.Value) -> ir.Value:
     """remainder.Tensor(Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
     return _aten_remainder(op, self, other, integer=self.dtype.is_integer())
 
 
@@ -1526,9 +1568,9 @@ def aten_remainder_scalar(
     op: TranslationContext, self: ir.Value, other: float
 ) -> ir.Value:
     """remainder.Scalar(Tensor self, Scalar other) -> Tensor"""
-    builder = op.builder
+    self, other = _promotion.promote(op, self, other)
 
-    other_tensor = builder.constant(other, dtype=self.dtype)
+    other_tensor = other
     return _aten_remainder(op, self, other_tensor, integer=self.dtype.is_integer())
 
 
@@ -1537,9 +1579,9 @@ def aten_remainder_scalar_tensor(
     op: TranslationContext, self: float, other: ir.Value
 ) -> ir.Value:
     """remainder.Scalar_Tensor(Scalar self, Tensor other) -> Tensor"""
-    builder = op.builder
+    self, other = _promotion.promote(op, self, other)
 
-    self_tensor = builder.constant(self, dtype=other.dtype)
+    self_tensor = self
     return _aten_remainder(op, self_tensor, other, integer=other.dtype.is_integer())
 
 
@@ -1573,6 +1615,7 @@ def aten_round_decimals(
 @onnx_impl(aten.rsqrt.default)
 def aten_rsqrt(op: TranslationContext, self: ir.Value) -> ir.Value:
     """rsqrt(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
 
     return op.Reciprocal(op.Sqrt(self))
 
@@ -1646,6 +1689,7 @@ def aten_sign(op: TranslationContext, self: ir.Value) -> ir.Value:
 @onnx_impl(aten.sin.default)
 def aten_sin(op: TranslationContext, self: ir.Value) -> ir.Value:
     """sin(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
 
     return op.Sin(self)
 
@@ -1653,6 +1697,7 @@ def aten_sin(op: TranslationContext, self: ir.Value) -> ir.Value:
 @onnx_impl(aten.sinh.default)
 def aten_sinh(op: TranslationContext, self: ir.Value) -> ir.Value:
     """sinh(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
 
     return op.Sinh(self)
 
@@ -1660,6 +1705,7 @@ def aten_sinh(op: TranslationContext, self: ir.Value) -> ir.Value:
 @onnx_impl(aten.sqrt.default)
 def aten_sqrt(op: TranslationContext, self: ir.Value) -> ir.Value:
     """sqrt(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
 
     return op.Sqrt(self)
 
@@ -1669,6 +1715,7 @@ def aten_sub(
     op: TranslationContext, self: ir.Value, other: ir.Value, alpha: float = 1.0
 ) -> ir.Value:
     """sub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
     if alpha != 1.0:
         alpha = op.CastLike(alpha, other)
         other = op.Mul(other, alpha)
@@ -1680,9 +1727,8 @@ def aten_sub_scalar(
     op: TranslationContext, self: ir.Value, other: float, alpha: float = 1.0
 ) -> ir.Value:
     """sub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor"""
-    builder = op.builder
+    self, other = _promotion.promote(op, self, other)
 
-    other = builder.constant(other, dtype=self.dtype)
     return aten_sub(op, self, other, alpha=alpha)
 
 
@@ -1697,6 +1743,7 @@ def aten_sub_complex(
     alpha: float = 1.0,
 ) -> ir.Value:
     """sub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor"""
+    self, other = _promotion.promote(op, self, other, packed_complex=True)
     other = common_ops.complex_scalar(op, other, dtype=self.dtype)
     return aten_sub(op, self, other, alpha=alpha)
 
@@ -1704,6 +1751,7 @@ def aten_sub_complex(
 @onnx_impl(aten.tan.default)
 def aten_tan(op: TranslationContext, self: ir.Value) -> ir.Value:
     """tan(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
 
     return op.Tan(self)
 
@@ -1711,6 +1759,7 @@ def aten_tan(op: TranslationContext, self: ir.Value) -> ir.Value:
 @onnx_impl(aten.tanh.default)
 def aten_tanh(op: TranslationContext, self: ir.Value) -> ir.Value:
     """tanh(Tensor self) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
 
     return op.Tanh(self)
 
@@ -1756,7 +1805,7 @@ def aten_all(op: TranslationContext, self: ir.Value) -> ir.Value:
         self_int = op.Cast(self_bool, to=ir.DataType.INT64)
         all_true = op.ReduceMin(self_int, keepdims=False)
         result = op.Cast(all_true, to=ir.DataType.BOOL)
-    return result
+    return _promotion.boolean_reduction(op, result, self)
 
 
 @onnx_impl(aten.all.dim)
@@ -1766,13 +1815,17 @@ def aten_all_dim(
     """all.dim(Tensor self, int dim, bool keepdim=False) -> Tensor"""
     builder = op.builder
     if len(self.shape) == 0:
-        return op.Cast(self, to=ir.DataType.BOOL)
+        return _promotion.boolean_reduction(
+            op, op.Cast(self, to=ir.DataType.BOOL), self
+        )
 
     self_bool = op.Cast(self, to=ir.DataType.BOOL)
     self_int = op.Cast(self_bool, to=ir.DataType.INT64)
     dims = op.Reshape(dim, builder.constant([-1], dtype=ir.DataType.INT64))
     all_true = op.ReduceMin(self_int, dims, keepdims=keepdim)
-    return op.Cast(all_true, to=ir.DataType.BOOL)
+    return _promotion.boolean_reduction(
+        op, op.Cast(all_true, to=ir.DataType.BOOL), self
+    )
 
 
 @onnx_impl(aten.all.dims)
@@ -1785,13 +1838,17 @@ def aten_all_dims(
     """all.dims(Tensor self, int[]? dim=None, bool keepdim=False) -> Tensor"""
 
     if not dim:
-        return _aten_all_dims_no_dim(op, self, keepdim)
+        return _promotion.boolean_reduction(
+            op, _aten_all_dims_no_dim(op, self, keepdim), self
+        )
     if len(self.shape) == 0:
-        return op.Cast(self, to=ir.DataType.BOOL)
+        return _promotion.boolean_reduction(
+            op, op.Cast(self, to=ir.DataType.BOOL), self
+        )
     self_bool = op.Cast(self, to=ir.DataType.BOOL)
     self_int = op.Cast(self_bool, to=ir.DataType.INT64)
     result = op.ReduceMin(self_int, list(dim), keepdims=keepdim)
-    return op.Cast(result, to=ir.DataType.BOOL)
+    return _promotion.boolean_reduction(op, op.Cast(result, to=ir.DataType.BOOL), self)
 
 
 def _aten_all_dims_no_dim(
@@ -1806,7 +1863,7 @@ def _aten_all_dims_no_dim(
         self_int = op.Cast(self_bool, to=ir.DataType.INT64)
         all_true = op.ReduceMin(self_int, keepdims=keepdims)
         result = op.Cast(all_true, to=ir.DataType.BOOL)
-    return result
+    return _promotion.boolean_reduction(op, result, self)
 
 
 @onnx_impl(aten.amax.default)
@@ -1857,7 +1914,7 @@ def aten_any(op: TranslationContext, self: ir.Value) -> ir.Value:
         self_int = op.Cast(self_bool, to=ir.DataType.INT64)
         any_true = op.ReduceMax(self_int, keepdims=False)
         result = op.Greater(any_true, 0)
-    return result
+    return _promotion.boolean_reduction(op, result, self)
 
 
 @onnx_impl(aten.any.dim)
@@ -1867,7 +1924,9 @@ def aten_any_dim(
     """any.dim(Tensor self, int dim, bool keepdim=False) -> Tensor"""
     builder = op.builder
     if len(self.shape) == 0:
-        return op.Cast(self, to=ir.DataType.BOOL)
+        return _promotion.boolean_reduction(
+            op, op.Cast(self, to=ir.DataType.BOOL), self
+        )
 
     self_bool = op.Cast(self, to=ir.DataType.BOOL)
     # op.ReduceMax() in the next step cannot process BOOL inputs, so convert to INT64
@@ -1875,7 +1934,7 @@ def aten_any_dim(
     # Change dim from int to INT64[1]
     dims = op.Reshape(dim, builder.constant([-1], dtype=ir.DataType.INT64))
     any_true = op.ReduceMax(self_int, dims, keepdims=keepdim)
-    return op.Greater(any_true, 0)
+    return _promotion.boolean_reduction(op, op.Greater(any_true, 0), self)
 
 
 @onnx_impl(aten.any.dims)
@@ -1888,13 +1947,17 @@ def aten_any_dims(
     """any.dims(Tensor self, int[1]? dim=None, bool keepdim=False) -> Tensor"""
 
     if not dim:
-        return _aten_any_dims_no_dim(op, self, keepdim)
+        return _promotion.boolean_reduction(
+            op, _aten_any_dims_no_dim(op, self, keepdim), self
+        )
     if len(self.shape) == 0:
-        return op.Cast(self, to=ir.DataType.BOOL)
+        return _promotion.boolean_reduction(
+            op, op.Cast(self, to=ir.DataType.BOOL), self
+        )
     self_bool = op.Cast(self, to=ir.DataType.BOOL)
     self_int = op.Cast(self_bool, to=ir.DataType.INT64)
     result = op.ReduceMax(self_int, list(dim), keepdims=keepdim)
-    return op.Greater(result, 0)
+    return _promotion.boolean_reduction(op, op.Greater(result, 0), self)
 
 
 def _aten_any_dims_no_dim(
@@ -1907,7 +1970,7 @@ def _aten_any_dims_no_dim(
         self_int = op.Cast(self_bool, to=ir.DataType.INT64)
         any_true = op.ReduceMax(self_int, keepdims=keepdims)
         result = op.Greater(any_true, 0)
-    return result
+    return _promotion.boolean_reduction(op, result, self)
 
 
 @onnx_impl(aten.argmax.default)
@@ -2053,6 +2116,9 @@ def aten_cumsum(
     op: TranslationContext, self: ir.Value, dim: ir.Value, dtype: int = -1
 ) -> ir.Value:
     """cumsum(Tensor self, int dim, *, ScalarType? dtype=None) -> Tensor"""
+    dtype, result_dtype = _promotion.reduction_dtypes(
+        op, self, dtype, integral_to_long=True
+    )
 
     # The accumulation type for int32 is int64.
     if dtype != -1 and dtype is not None:
@@ -2066,7 +2132,7 @@ def aten_cumsum(
         result = op.Identity(cast)
     else:
         result = op.CumSum(cast, dim)
-    return result
+    return _promotion.reduction_result(op, result, result_dtype)
 
 
 @onnx_impl(aten.expand.default)
@@ -2419,6 +2485,7 @@ def aten_logsumexp(
     op: TranslationContext, self: ir.Value, dim: ir.Value, keepdim: int = False
 ) -> ir.Value:
     """logsumexp(Tensor self, int[1] dim, bool keepdim=False) -> Tensor"""
+    (self,) = _promotion.promote(op, self, kind="INT_TO_FLOAT")
 
     if len(self.shape) == 0:
         # A scalar
@@ -2529,6 +2596,9 @@ def aten_max_dim(
 @onnx_impl(aten.mean.default)
 def aten_mean(op: TranslationContext, self: ir.Value, dtype: int = -1) -> ir.Value:
     """mean(Tensor self, *, ScalarType? dtype=None) -> Tensor"""
+    dtype, result_dtype = _promotion.reduction_dtypes(
+        op, self, dtype, integral_to_long=False
+    )
 
     if dtype != -1 and dtype is not None:
         # Cast before reducing so that the accumulation happens in the requested
@@ -2537,7 +2607,7 @@ def aten_mean(op: TranslationContext, self: ir.Value, dtype: int = -1) -> ir.Val
         self = op.Cast(self, to=dtype)
 
     result = op.ReduceMean(self)
-    return op.Squeeze(result)
+    return _promotion.reduction_result(op, op.Squeeze(result), result_dtype)
 
 
 @onnx_impl(aten.mean.dim)
@@ -2549,6 +2619,9 @@ def aten_mean_dim(
     dtype: int = -1,
 ) -> ir.Value:
     """mean.dim(Tensor self, int[1]? dim, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor"""
+    dtype, result_dtype = _promotion.reduction_dtypes(
+        op, self, dtype, integral_to_long=False
+    )
     builder = op.builder
     self_is_scalar = len(self.shape) == 0
     if dtype != -1 and dtype is not None:
@@ -2567,7 +2640,7 @@ def aten_mean_dim(
     if dtype != -1 and dtype is not None:
         result = op.Cast(result, to=dtype)
 
-    return result
+    return _promotion.reduction_result(op, result, result_dtype)
 
 
 @onnx_impl(aten.mean.default, complex=True)
@@ -2718,12 +2791,17 @@ def aten_permute_complex(
 @onnx_impl(aten.prod.default)
 def aten_prod(op: TranslationContext, self: ir.Value, dtype: int = -1) -> ir.Value:
     """prod(Tensor self, *, ScalarType? dtype=None) -> Tensor"""
+    dtype, result_dtype = _promotion.reduction_dtypes(
+        op, self, dtype, integral_to_long=True
+    )
 
     if dtype != -1 and dtype is not None:
         self = op.Cast(self, to=dtype)
     elif self.dtype.is_integer() or self.dtype == ir.DataType.BOOL:
         self = op.Cast(self, to=ir.DataType.INT64)
-    return op.ReduceProd(self, keepdims=False)
+    return _promotion.reduction_result(
+        op, op.ReduceProd(self, keepdims=False), result_dtype
+    )
 
 
 @onnx_impl(aten.prod.dim_int)
@@ -2735,6 +2813,9 @@ def aten_prod_dim_int(
     dtype: int = -1,
 ) -> ir.Value:
     """prod.dim_int(Tensor self, int dim, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor"""
+    dtype, result_dtype = _promotion.reduction_dtypes(
+        op, self, dtype, integral_to_long=True
+    )
     self_is_scalar = len(self.shape) == 0
 
     if dtype != -1 and dtype is not None:
@@ -2742,8 +2823,10 @@ def aten_prod_dim_int(
     elif self.dtype.is_integer() or self.dtype == ir.DataType.BOOL:
         self = op.Cast(self, to=ir.DataType.INT64)
     if self_is_scalar:
-        return op.Identity(self)
-    return op.ReduceProd(self, [dim], keepdims=keepdim)
+        return _promotion.reduction_result(op, op.Identity(self), result_dtype)
+    return _promotion.reduction_result(
+        op, op.ReduceProd(self, [dim], keepdims=keepdim), result_dtype
+    )
 
 
 @onnx_impl(aten.repeat.default)
@@ -3127,6 +3210,9 @@ def aten_squeeze_dim_complex(
 @onnx_impl(aten.sum.default)
 def aten_sum(op: TranslationContext, self: ir.Value, dtype: int = -1) -> ir.Value:
     """sum(Tensor self, *, ScalarType? dtype=None) -> Tensor"""
+    dtype, result_dtype = _promotion.reduction_dtypes(
+        op, self, dtype, integral_to_long=True
+    )
     self_is_scalar = len(self.shape) == 0
     if dtype != -1 and dtype is not None:
         self = op.Cast(self, to=dtype)
@@ -3138,7 +3224,7 @@ def aten_sum(op: TranslationContext, self: ir.Value, dtype: int = -1) -> ir.Valu
         result = op.ReduceSum(self, keepdims=False)
     if dtype != -1 and dtype is not None:
         result = op.Cast(result, to=dtype)
-    return result
+    return _promotion.reduction_result(op, result, result_dtype)
 
 
 @onnx_impl(aten.sum.default, complex=True)
@@ -3169,6 +3255,9 @@ def aten_sum_dim_IntList(
     dtype: int = -1,
 ) -> ir.Value:
     """sum.dim_IntList(Tensor self, int[1]? dim, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor"""
+    dtype, result_dtype = _promotion.reduction_dtypes(
+        op, self, dtype, integral_to_long=True
+    )
     self_is_scalar = len(self.shape) == 0
     if dtype != -1 and dtype is not None:
         self = op.Cast(self, to=dtype)
@@ -3187,7 +3276,7 @@ def aten_sum_dim_IntList(
     if dtype != -1 and dtype is not None:
         result = op.Cast(result, to=dtype)
 
-    return result
+    return _promotion.reduction_result(op, result, result_dtype)
 
 
 @onnx_impl(aten.sum.dim_IntList, complex=True)
@@ -3520,6 +3609,7 @@ def aten_where(
     op: TranslationContext, condition: ir.Value, self: ir.Value, other: ir.Value
 ) -> ir.Value:
     """where.self(Tensor condition, Tensor self, Tensor other) -> Tensor"""
+    self, other = _promotion.promote(op, self, other)
 
     return op.Where(condition, self, other)
 

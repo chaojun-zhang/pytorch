@@ -12,7 +12,11 @@ import onnx_ir as ir
 import torch
 from torch.onnx._internal.exporter._ir_builder import GraphBuilder, TranslationContext
 from torch.onnx._internal.exporter._torchlib._torchlib_registry import onnx_impl
-from torch.onnx._internal.exporter._torchlib.ops import common as common_ops, core
+from torch.onnx._internal.exporter._torchlib.ops import (
+    _promotion,
+    common as common_ops,
+    core,
+)
 
 
 aten = torch.ops.aten
@@ -118,6 +122,7 @@ def aten_atleast_3d_sequence(
 # Do not register hstack - decomposed by PyTorch: https://github.com/pytorch/pytorch/blob/bedf96d7ffe74b34bcfe52c7ae1ae05f40d6c8ee/torch/_refs/__init__.py#L3918
 def aten_hstack(op: TranslationContext, tensors: Sequence[ir.Value]) -> ir.Value:
     """hstack(Tensor[] tensors) -> Tensor"""
+    tensors = _promotion.promote_sequence(op, tensors)
     builder = op.builder
     if not isinstance(tensors, ir.Value):
         if not tensors:
@@ -154,6 +159,7 @@ def aten_hstack(op: TranslationContext, tensors: Sequence[ir.Value]) -> ir.Value
 # Do not register vstack - decomposed by PyTorch: https://github.com/pytorch/pytorch/blob/bedf96d7ffe74b34bcfe52c7ae1ae05f40d6c8ee/torch/_refs/__init__.py#L3918
 def aten_vstack(op: TranslationContext, tensors: Sequence[ir.Value]) -> ir.Value:
     """vstack(Tensor[] tensors) -> Tensor"""
+    tensors = _promotion.promote_sequence(op, tensors)
     # The same logic as atleast_2d is shared explicitly in the native implementation.
     return aten_cat(op, _atleast_sequence(op, tensors, 2), 0)
 
@@ -165,6 +171,7 @@ def aten_cat_complex(
     op: TranslationContext, tensors: Sequence[ir.Value], dim: int = 0
 ) -> ir.Value:
     """cat(Tensor[] tensors, int dim=0) -> Tensor"""
+    tensors = _promotion.promote_sequence(op, tensors, packed_complex=True)
     # Real representation unsqueezes the last dimension
     if dim < 0:
         dim = dim - 1
@@ -176,6 +183,7 @@ def aten_cat(
     op: TranslationContext, tensors: Sequence[ir.Value], dim: int = 0
 ) -> ir.Value:
     """cat(Tensor[] tensors, int dim=0) -> Tensor"""
+    tensors = _promotion.promote_sequence(op, tensors)
     if isinstance(tensors, ir.Value):
         return op.ConcatFromSequence(
             tensors,
@@ -421,6 +429,7 @@ def aten_stack_complex(
     op: TranslationContext, tensors: Sequence[ir.Value], dim: int = 0
 ) -> ir.Value:
     """stack(Tensor[] tensors, int dim=0) -> Tensor"""
+    tensors = _promotion.promote_sequence(op, tensors, packed_complex=True)
     # Real representation unsqueezes the last dimension
     if dim < 0:
         dim = dim - 1
@@ -432,6 +441,7 @@ def aten_stack(
     op: TranslationContext, tensors: Sequence[ir.Value], dim: int = 0
 ) -> ir.Value:
     """stack(Tensor[] tensors, int dim=0) -> Tensor"""
+    tensors = _promotion.promote_sequence(op, tensors)
     builder = op.builder
     if isinstance(tensors, Sequence):
         unsqueezed = [
