@@ -128,6 +128,105 @@ class TestReinplacingPassCorrectness(InductorTestCase):
 
         self._test(f)
 
+    @staticmethod
+    def _chained_reinplacement_case(use_view):
+        class Model(torch.nn.Module):
+            def forward(self, x, indices, first_values, second_values, replacement):
+                first = x.index_put((indices,), first_values)
+                view = first.view_as(first) if use_view else first
+                second = view.index_put((indices,), second_values)
+                x.copy_(replacement)
+                return second
+
+        model = Model()
+        x = torch.arange(8, dtype=torch.float32).reshape(2, 4).clone()
+        inputs = (
+            torch.tensor([0]),
+            torch.full((4,), 10.0),
+            torch.full((4,), 20.0),
+            torch.full_like(x, -1.0),
+        )
+        expected_input = x.clone()
+        expected = model(expected_input, *inputs)
+        return model, x, inputs, expected_input, expected
+
+    @parametrize("use_view", [False, True])
+    def test_chained_reinplacement_preserves_last_result_graph(self, use_view):
+        model, x, inputs, expected_input, expected = self._chained_reinplacement_case(
+            use_view
+        )
+        gm = make_fx(model, tracing_mode="fake")(x, *inputs)
+        reinplace_inplaceable_ops_core(gm.graph)
+        gm.graph.lint()
+        gm.recompile()
+        actual_input = x.clone()
+        actual = gm(actual_input, *inputs)
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual_input, expected_input)
+        first = next(n for n in gm.graph.nodes if n.target is aten.index_put_.default)
+        second = next(n for n in gm.graph.nodes if n.target is aten.index_put.default)
+        self.assertEqual(get_node_storage(first), get_node_storage(first.args[0]))
+        self.assertNotEqual(get_node_storage(second), get_node_storage(first))
+
+    @parametrize("use_view", [False, True])
+    def test_chained_reinplacement_preserves_last_result_torch_compile(
+        self, use_view
+    ):
+        model, x, inputs, expected_input, expected = self._chained_reinplacement_case(
+            use_view
+        )
+        actual_input = x.clone()
+        actual = torch.compile(model, fullgraph=True)(actual_input, *inputs)
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual_input, expected_input)
+
+    def test_reinplacement_refreshes_sparse_output(self):
+        def f(values, sparse_indices, indices, updates):
+            values = values + 1
+            values = values.index_put((indices,), updates)
+            return aten._sparse_coo_tensor_with_dims_and_tensors.default(
+                1, 1, [4, 2], sparse_indices, values, layout=torch.sparse_coo
+            )
+
+        inputs = (
+            torch.arange(6, dtype=torch.float32).reshape(3, 2),
+            torch.tensor([[0, 1, 3]]),
+            torch.tensor([1]),
+            torch.full((1, 2), 10.0),
+        )
+        gm = make_fx(f, tracing_mode="fake")(*inputs)
+        reinplace_inplaceable_ops_core(gm.graph)
+        gm.graph.lint()
+        gm.recompile()
+        self.assertIn(aten.index_put_.default, [n.target for n in gm.graph.nodes])
+        self.assertEqual(gm(*inputs).to_dense(), f(*inputs).to_dense())
+
+    def test_reinplacement_drains_repeated_copy_replacements(self):
+        def f(x, y, z, indices, updates):
+            outputs = []
+            for x in (x, y, z):
+                result = x.index_put((indices,), updates)
+                x.copy_(result)
+                outputs.append(x.view(-1))
+            return tuple(outputs)
+
+        inputs = (
+            torch.randn(8), torch.randn(8), torch.randn(8),
+            torch.tensor([0]), torch.tensor([2.0]),
+        )
+        gm = make_fx(f, tracing_mode="fake")(*inputs)
+        expected_inputs = tuple(x.clone() for x in inputs)
+        expected = f(*expected_inputs)
+        reinplace_inplaceable_ops_core(gm.graph)
+        gm.graph.lint()
+        gm.recompile()
+        actual_inputs = tuple(x.clone() for x in inputs)
+        self.assertEqual(gm(*actual_inputs), expected)
+        self.assertEqual(actual_inputs, expected_inputs)
+        targets = [n.target for n in gm.graph.nodes]
+        self.assertEqual(targets.count(aten.index_put_.default), 3)
+        self.assertNotIn(aten.copy_.default, targets)
+
     def test_should_modify_inner(self):
         def f(x, y):
             x = x.cos()
@@ -1077,9 +1176,7 @@ class TestReinplacingPassCorrectness(InductorTestCase):
             if my_wait_functional._opoverload in inplaceable_ops:
                 del inplaceable_ops[my_wait_functional._opoverload]
 
-
 instantiate_parametrized_tests(TestReinplacingPassCorrectness)
-
 
 if __name__ == "__main__":
     if IS_LINUX and HAS_GPU:
