@@ -82,14 +82,15 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         help="list the tests under each PATH that containers of this size can run",
         description="Collect each test file under the PATHs in a container sized by "
         "--gpu, --cpu and --memory, which leaves out the tests whose tci constraints "
-        "it doesn't meet. PYTEST_ARGS go to the collection, so -- -k linear lists "
+        "it doesn't meet, and plan the pieces, of about 150 s by CI's times, that "
+        "containers would run. PYTEST_ARGS go to the collection, so -- -k linear lists "
         "fewer tests.",
     )
     test_parser.add_argument(
         "--list",
         action="store_true",
         required=True,  # until test can run them
-        help="print each test as a line of JSON on stdout, and run nothing",
+        help="print each test and its piece as a line of JSON on stdout, and run nothing",
     )
     test_parser.add_argument(
         "paths",

@@ -1,10 +1,13 @@
 """The machine this process runs on, for judging tci constraints. It is read as
-torchci's report reads it: without a device context, which tests can observe."""
+torchci's report reads it: without a device context, which tests can observe.
+``python -m torch.testing._internal.tci.machine`` prints it as JSON."""
 
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import functools
+import json
 import sys
 
 import torch
@@ -48,3 +51,7 @@ def _cuda_capability() -> tuple[int, int]:
         return major.value, minor.value
     finally:
         nvml.nvmlShutdown()
+
+
+if __name__ == "__main__":
+    print(json.dumps(dataclasses.asdict(capture())))

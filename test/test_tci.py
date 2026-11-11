@@ -293,6 +293,11 @@ class TestPluginCollects(TestCase):
         kept = [line.partition("::")[2] for line in done.stdout.splitlines()]
         return list(filter(None, kept)), deselected
 
+    def test_machine_module_prints_the_machine(self) -> None:
+        printed = subprocess.check_output([sys.executable, "-m", machine.__name__])
+        fields = [field.name for field in dataclasses.fields(tci.Machine)]
+        self.assertEqual(list(json.loads(printed.splitlines()[-1])), fields)
+
     def test_deselects_what_the_machine_cant_run(self) -> None:
         kept, deselected = self.collect()
         self.assertEqual(kept, ["TestSample::test_kept", "TestPlain::test_plain"])

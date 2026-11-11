@@ -8,8 +8,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict
 
 import modal
 
@@ -29,9 +30,29 @@ class Collected(TypedDict):
     error: str  # the end of the output if collecting failed, else empty
     seconds: float  # how long collecting took
     container: str  # Modal's id for the container that did it
+    machine: dict[str, Any]  # the container as tci reads it: its GPUs' name, count...
+
+
+def environ() -> dict[str, str]:
+    """The environment of what a container runs in /pytorch."""
+    # Modal's PYTHONPATH holds its own packages and the tools/ it mounts to import
+    # this module, which would shadow /pytorch/tools; the image sets none
+    return {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+
+
+def machine() -> dict[str, Any]:
+    """This container, as tci reads it."""
+    command = [sys.executable, "-m", "torch.testing._internal.tci.machine"]
+    output = {"capture_output": True, "text": True}
+    done = subprocess.run(command, cwd=f"{ROOT}/test", env=environ(), **output)
+    if done.returncode != 0:
+        raise RuntimeError(f"can't read the machine:\n{done.stderr[-TAIL:]}")
+    return json.loads(done.stdout.splitlines()[-1])
 
 
 class Worker:
+    machine: Future[dict[str, Any]]  # being read since sync
+
     @modal.enter()
     def sync(self) -> None:
         """Once per container, what run.sync_files does to a runner: rm for the files
@@ -40,6 +61,8 @@ class Worker:
             Path(ROOT, path).unlink(missing_ok=True)
         if Path(CHANGES).stat().st_size:  # empty when no file changed
             subprocess.run(["tar", "-xf", CHANGES], cwd=ROOT, check=True)
+        # Read while the first files are collected: it takes as long as importing torch
+        self.machine = ThreadPoolExecutor(1).submit(machine)
 
     @modal.method()
     def collect(self, name: str, pytest_args: list[str]) -> Collected:
@@ -48,9 +71,7 @@ class Worker:
         # Launched as run_test.py launches it, so the file's __main__ guard decides
         # here too: pytest alone collects files that guard never lets run
         launch = [sys.executable, "-bb", f"{name}.py", "--use-pytest", "--collect-only"]
-        # Modal's PYTHONPATH holds its own packages and the tools/ it mounts to import
-        # this module, which would shadow /pytorch/tools; the image sets none
-        env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        env = environ()
         output = {"capture_output": True, "text": True, "errors": "replace"}
         start = time.monotonic()
         with tempfile.NamedTemporaryFile() as deselected:
@@ -68,4 +89,5 @@ class Worker:
             "error": (done.stderr + done.stdout)[-TAIL:] if failed else "",
             "seconds": time.monotonic() - start,
             "container": os.environ.get("MODAL_TASK_ID", ""),
+            "machine": self.machine.result(),
         }

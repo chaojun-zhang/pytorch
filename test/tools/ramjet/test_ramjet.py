@@ -1,6 +1,7 @@
 # Owner(s): ["module: devx"]
 
 import contextlib
+import dataclasses
 import getpass
 import importlib.util
 import io
@@ -24,12 +25,13 @@ from torch.testing._internal.common_utils import (
     skipIfWindows,
     TestCase,
 )
+from torch.testing._internal.tci import machine
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
 
-from tools.ramjet import common, inputs, lineage, sync
+from tools.ramjet import common, inputs, lineage, sync, times
 
 
 HAS_MODAL = importlib.util.find_spec("modal") is not None
@@ -80,6 +82,15 @@ unmet = {"[two]": "@tci.needs(tci.gpus >= 2)", "_rocm": "@tci.only(tci.rocm)"}
 with open(deselected, "w") as file:
     json.dump({second + test: constraint for test, constraint in unmet.items()}, file)
 """
+# Stands in for the ci-metrics wrapper: in a directory outside the repository, it
+# keeps each query it is sent, and it answers all of them with the same rows
+WRAPPER = """\
+#!/bin/sh
+for query; do :; done
+printf '%s\\n' "$query" >> {0}/queries
+cat {0}/rows.json
+"""
+L4 = {"accelerator": "cuda", "gpus": 1, "device": "NVIDIA L4", "gpu_memory": 22.5}
 
 
 @contextlib.contextmanager
@@ -142,6 +153,12 @@ class TestRepo(TestCase):
     def write(self, path: str, text: str) -> None:
         (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
         (self.repo / path).write_text(text)
+
+    def answer(self, rows: list[list[Any]]) -> None:
+        """Have CI's times be these rows: a test, its seconds here and anywhere."""
+        self.write(times.WRAPPER, WRAPPER.format(self.tmp))
+        (self.repo / times.WRAPPER).chmod(0o755)
+        (self.tmp / "rows.json").write_text(json.dumps({"rows": rows}))
 
     def edit(self) -> None:
         self.write("edited.py", "edited\n")
@@ -263,6 +280,34 @@ class TestRepo(TestCase):
         run.sync_files(LocalRunner(runner), self.base, commit, self.tmp)
         self.assertEqual(files(runner), files(self.repo))
 
+    def test_times(self) -> None:
+        files = {"test/test_a.py": 3, "test/it's.py": 2}
+        with self.assertLogs("ramjet", "WARNING") as logs:  # no wrapper to run
+            self.assertEqual(times.fetch(files, "NVIDIA L4", 1), {})
+        self.assertIn("no test times from CI:\n", logs.output[0])
+        failing = "#!/bin/sh\necho gh: not logged in >&2\necho gcx.error\nexit 1\n"
+        self.write(times.WRAPPER, failing)
+        (self.repo / times.WRAPPER).chmod(0o755)
+        with self.assertLogs("ramjet", "WARNING") as logs:
+            self.assertEqual(times.fetch(files, "NVIDIA L4", 1), {})
+        message = "no test times from CI:\ngh: not logged in\ngcx.error"
+        self.assertEqual(logs.records[0].getMessage(), message)
+        one, two = "test/test_a.py::A::test_one", "test/test_a.py::test_two"
+        self.answer([[one, 1.5, 2.0], [two, None, 0.25]])
+        fetched = times.fetch(files, "NVIDIA L4", 1)
+        self.assertEqual(fetched, {one: (1.5, 2.0), two: (None, 0.25)})
+        query = (self.tmp / "queries").read_text()
+        self.assertIn("e.device_name = 'NVIDIA L4' AND e.device_count = 1", query)
+        self.assertIn("t.file IN ('test/test_a.py', 'test/it\\'s.py')", query)
+        with mock.patch.object(times, "BATCH", 4):  # a query for each file, then
+            times.fetch(files, "", 0)
+        queries = (self.tmp / "queries").read_text().split("SELECT")[2:]
+        self.assertEqual(len(queries), 2)
+        self.assertIn("e.device_name = '' AND e.device_count = 0", queries[0])
+        (self.tmp / "rows.json").write_text('{"rows": null}')  # CI ran none of them
+        with self.assertNoLogs("ramjet", "WARNING"):
+            self.assertEqual(times.fetch(files, "NVIDIA L4", 1), {})
+
     @unittest.skipUnless(HAS_MODAL, "needs modal")
     def test_list_tests(self) -> None:
         container = self.tmp / "container"  # its /pytorch, at the build image's commit
@@ -272,6 +317,10 @@ class TestRepo(TestCase):
         self.edit()
         self.write("test/test_file.py", TEST_FILE)
         self.write("test/test_broken.py", "raise ImportError('no such module')\n")
+        launched = f"--use-pytest --collect-only -p {worker.TCI} -k second -v"
+        second = "test/test_file.py::TestFile::test_second"
+        nodeid = f"{second}[{launched} --verbosity=-1 no PYTHONPATH]"
+        self.answer([[nodeid, 2.0, 3.0]])
         commit = sync.snapshot_tree()
 
         def local_map(names: list[str], kwargs: Any, return_exceptions: bool) -> Any:
@@ -290,12 +339,19 @@ class TestRepo(TestCase):
         image.add_local_file.side_effect = add_local_file
         new_app = modal.App.return_value
         new_app.cls.return_value.return_value.return_value.collect.map = local_map
+
+        def fetch(*args: Any) -> Any:
+            new_app.run.return_value.__exit__.assert_called_once()  # containers stopped
+            return mock.DEFAULT  # what times.fetch returns
+
         modal_sets = {"PYTHONPATH": "/pkg/:/root/", "MODAL_TASK_ID": "ta-1"}
         for patcher in [
             mock.patch.object(test, "modal", modal),
+            mock.patch.object(times, "fetch", wraps=times.fetch, side_effect=fetch),
             mock.patch.object(worker, "ROOT", str(container)),
             mock.patch.object(worker, "CHANGES", str(self.tmp / "changes.tar")),
             mock.patch.object(worker, "DELETED", str(self.tmp / "deleted")),
+            mock.patch.object(worker, "machine", return_value=L4),
             mock.patch.dict(os.environ, modal_sets),
         ]:
             patcher.start()
@@ -313,11 +369,8 @@ class TestRepo(TestCase):
         with self.assertLogs(test.log, "DEBUG") as logs:
             with contextlib.redirect_stdout(io.StringIO()) as stdout:
                 self.assertEqual(test.list_tests(*args), 1)
-        launched = f"--use-pytest --collect-only -p {worker.TCI} -k second -v"
-        second = "test/test_file.py::TestFile::test_second"
-        nodeid = f"{second}[{launched} --verbosity=-1 no PYTHONPATH]"
         listed = [json.loads(line) for line in stdout.getvalue().splitlines()]
-        self.assertEqual(listed, [{"nodeid": nodeid}])
+        self.assertEqual(listed, [{"nodeid": nodeid, "piece": 1}])
         messages = [record.getMessage() for record in logs.records]
         self.assertEqual(messages[0], "collecting 3 files on L4")
         took = r"^test/test_%s\.py took \d+\.\d s on container ta-1$"
@@ -331,7 +384,19 @@ class TestRepo(TestCase):
         self.assertIn("test/test_lost.py failed:", messages[5])
         self.assertIn("container lost", messages[5])
         left_out = ["left out 1 test that L4 can't run:", f"  1 with {needs}"]
-        self.assertEqual(messages[6:], ["listed 1 test from 1 file", *left_out])
+        self.assertEqual(messages[6:9], ["listed 1 test from 1 file", *left_out])
+        # CI took 2 s for the test on an L4, which is the machine it was asked about
+        sources = "1 test with 1 x NVIDIA L4, 0 on other machines, 0 guessed"
+        seconds = round(test.START_SECONDS + 2 * test.SLOWDOWN)
+        planned = [
+            f"CI's times: {sources}",
+            f"piece 1, about {seconds} s: 1 test of 1 file",
+            f"1 piece: 1 container-minute, the longest about {seconds} s",
+        ]
+        self.assertEqual(messages[9:], planned)
+        query = (self.tmp / "queries").read_text()
+        self.assertIn("e.device_name = 'NVIDIA L4' AND e.device_count = 1", query)
+        self.assertIn("t.file IN ('test/test_file.py')", query)
         self.assertEqual(files(container), files(self.repo))  # synced first
         options = {
             "image": image,
@@ -655,16 +720,101 @@ class TestTest(TestCase):
                 test.names([path])
 
     def test_collect(self) -> None:
-        with mock.patch.object(worker, "ROOT", str(REPO_ROOT)):
-            # This file, launched as run_test.py launches it
-            collected = worker.Worker().collect(self.THIS, ["-k", "test_names", "-v"])
-            missing = worker.Worker().collect("tools/ramjet/missing", [])
+        with tempfile.NamedTemporaryFile() as nothing:  # changed or deleted
+            here = {"ROOT": str(REPO_ROOT), "CHANGES": nothing.name}
+            with mock.patch.multiple(worker, DELETED=nothing.name, **here):
+                started = worker.Worker()
+                started.sync()
+                # This file, launched as run_test.py launches it
+                collected = started.collect(self.THIS, ["-k", "test_names", "-v"])
+                missing = started.collect("tools/ramjet/missing", [])
         ids = [f"test/{self.THIS}.py::TestTest::test_names"]
         self.assertEqual((collected["ids"], collected["error"]), (ids, ""))
         self.assertEqual(collected["left_out"], {})  # no test here has a constraint
         self.assertGreater(collected["seconds"], 0)
+        read = json.loads(json.dumps(dataclasses.asdict(machine.capture())))
+        self.assertEqual(collected["machine"], read)
         self.assertEqual(missing["ids"], [])
         self.assertIn("missing.py", missing["error"])
+
+    def test_timed(self) -> None:
+        kept = {
+            "test_a": ["test/test_a.py::A::test_here", "test/test_a.py::A::test_other"],
+            "test_b": [f"test/test_b.py::B::test_{n}" for n in range(4)],
+            "test_new": ["test/test_new.py::New::test_new"],
+        }
+        ci = {
+            "test/test_a.py::A::test_here": (4.0, 1.0),
+            "test/test_a.py::A::test_other": (None, 2.0),
+            "test/test_b.py::B::test_0": (1.0, 5.0),
+            "test/test_b.py::B::test_2": (3.0, 5.0),
+        }
+        with (
+            mock.patch.object(times, "fetch", return_value=ci) as fetch,
+            self.assertLogs(test.log, "DEBUG") as logs,
+        ):
+            timed = test.timed(kept, L4)
+        fetch.assert_called_once_with(
+            {"test/test_a.py": 2, "test/test_b.py": 4, "test/test_new.py": 1},
+            "NVIDIA L4",
+            1,
+        )
+        # CI's seconds: here, else anywhere, else its file's median, else a guess
+        expected = {
+            "test_a": [4.0, 2.0],
+            "test_b": [1.0, 2.0, 3.0, 2.0],
+            "test_new": [test.GUESS_SECONDS],
+        }
+        seconds = {name: [s / test.SLOWDOWN for _, s in timed[name]] for name in timed}
+        self.assertEqual(seconds, expected)
+        ids = {name: [nodeid for nodeid, _ in tests] for name, tests in timed.items()}
+        self.assertEqual(ids, kept)
+        sources = "3 tests with 1 x NVIDIA L4, 1 on other machines, 3 guessed"
+        guessed = "guessed the time of 3 tests that CI has none for"
+        logged = [record.getMessage() for record in logs.records]
+        self.assertEqual(logged, [f"CI's times: {sources}", guessed])
+        self.assertEqual(logs.records[1].levelname, "INFO")
+
+    def test_progress(self) -> None:
+        def wait_for(message: str) -> None:
+            deadline = time.monotonic() + 60
+            while message not in [record.getMessage() for record in logs.records]:
+                self.assertLess(time.monotonic(), deadline, f"never logged: {message}")
+                time.sleep(0.01)
+
+        often = mock.patch.object(test, "PROGRESS_SECONDS", 0.01)
+        collected = {"container": "ta-1"}
+        with often, self.assertLogs(test.log, "INFO") as logs:
+            with test.progress(5) as back:
+                wait_for("  no file collected yet: waiting for containers")
+                back += [collected, ConnectionError("container lost"), collected]
+                wait_for("  3 of 5 files collected by 1 container")
+                back.append({"container": "ta-2"})
+                wait_for("  4 of 5 files collected by 2 containers")
+            logged = len(logs.records)
+            time.sleep(0.05)
+            self.assertEqual(len(logs.records), logged)  # it stopped with the block
+
+    def test_shard(self) -> None:
+        start = test.START_SECONDS
+        timed = {
+            "big": [(f"big::{n}", 40.0) for n in range(10)],  # three fit in a piece
+            "small": [("small::0", 10.0), ("small::1", 10.0)],
+            "medium": [("medium::0", 100.0)],
+            "huge": [("huge::0", 400.0)],  # longer than a piece
+        }
+        pieces = test.shard(timed)
+        planned = [(round(p.seconds - start * len(p.tests)), p.tests) for p in pieces]
+        expected = [
+            (400, {"huge": ["huge::0"]}),
+            # small goes to the first piece with room for it, of the longest first
+            (120, {"medium": ["medium::0"], "small": ["small::0", "small::1"]}),
+            (120, {"big": ["big::0", "big::1", "big::2"]}),
+            (120, {"big": ["big::3", "big::4", "big::5"]}),
+            (120, {"big": ["big::6", "big::7", "big::8"]}),
+            (40, {"big": ["big::9"]}),
+        ]
+        self.assertEqual(planned, expected)
 
 
 if __name__ == "__main__":
