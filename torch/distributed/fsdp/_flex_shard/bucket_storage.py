@@ -24,8 +24,7 @@ from .placement_contract import (
     GradientReduceOp,
     GradientReduction,
 )
-from .sharded_param import set_sharding_info
-from .utils import _get_single_placement, _set_param_on_module
+from .utils import _get_single_placement
 
 
 if TYPE_CHECKING:
@@ -207,6 +206,18 @@ class BucketLayout:
     param_layouts: dict[str, BucketParamLayout]
 
 
+@dataclass(frozen=True)
+class ParamMeta:
+    """The autograd and grad-dtype settings of a parameter whose sharded data
+    is not the parameter itself, e.g. the local tensor of a DTensor parameter
+    that ``fully_shard`` shards. Its Python attributes, outer layout and
+    partial-grad group are not carried over."""
+
+    requires_grad: bool
+    has_explicit_grad_dtype: bool = False
+    grad_dtype_override: torch.dtype | None = None
+
+
 @dataclass
 class ParamInfo:
     """Metadata for a parameter in chunked storage."""
@@ -340,6 +351,8 @@ class ShardedBucketStorage:
         # See set_cpu_offload
         self._cpu_offload: CPUOffloadPolicy | None = None
         self._compute_device: torch.device | None = None
+        # The runtime that runs this bucket (flex_shard's buckets)
+        self.runtime: BucketRuntime | None = None
         # FSDP2's custom ReduceScatter and set_reduce_scatter_input_fn.
         self._reduce_scatter_comm: Any = None
         self._reduce_scatter_input_fn: Any = None
@@ -376,8 +389,11 @@ class ShardedBucketStorage:
         device: torch.device,
         bucket_spec: BucketSpec,
         shared_names: dict[str, list[str]] | None = None,
+        context: BucketCommContext | None = None,
     ) -> ShardedBucketStorage:
-        """Create storage metadata for one bucket and install sharded params."""
+        """Create one bucket's storage and its runtime in ``context``, and keep
+        its parameters' shards in the storage, installing sharded parameters
+        that view them in their modules (see ``ParamHoming``)."""
         param_infos, total_bytes = cls.create_param_infos(
             named_params,
             mesh,
@@ -388,20 +404,9 @@ class ShardedBucketStorage:
             if fqn in param_infos:
                 param_infos[fqn].shared_fqns = tuple(other_fqns)
         offload_policy = bucket_spec.offload_policy
-        if isinstance(offload_policy, CPUOffloadPolicy):
-            byte_storage = torch.empty(
-                total_bytes,
-                dtype=torch.uint8,
-                device="cpu",
-                pin_memory=offload_policy.pin_memory,
-            )
-            expected_param_device = torch.device("cpu")
-        else:
-            byte_storage = torch.empty(total_bytes, dtype=torch.uint8, device=device)
-            expected_param_device = torch.device(device)
-
         bucket_storage = cls(
-            byte_storage,
+            # ParamHoming.install allocates the storage and fills it
+            torch.empty(0, dtype=torch.uint8, device=device),
             param_infos,
             mesh,
             total_bytes,
@@ -418,8 +423,18 @@ class ShardedBucketStorage:
         )
         if isinstance(offload_policy, CPUOffloadPolicy):
             bucket_storage.set_cpu_offload(offload_policy, torch.device(device))
-        bucket_storage.copy_params_from(named_params)
-        bucket_storage.install_sharded_params(expected_param_device)
+        from .bucket_runtime import BucketCommContext, BucketRuntime
+        from .param_homing import install_params
+        from .utils import _get_device_from_mesh
+
+        compute_device = _get_device_from_mesh(mesh)
+        runtime = bucket_storage.runtime = BucketRuntime.from_bucket_storage(
+            bucket_storage, context or BucketCommContext.for_device(compute_device)
+        )
+        params = dict(named_params)
+        install_params(
+            runtime, [params[info.fqn] for info in runtime.infos], compute_device
+        )
         return bucket_storage
 
     @classmethod
@@ -429,9 +444,12 @@ class ShardedBucketStorage:
         mesh: DeviceMesh,
         param_placements: dict[str, tuple[Placement, ...]],
         mp_policy: MixedPrecisionPolicy | None = None,
+        metas: dict[str, ParamMeta] | None = None,
     ) -> tuple[dict[str, ParamInfo], int]:
         """
         Create ParamInfo for each parameter, computing local layout and byte offsets.
+        ``metas`` gives the settings of parameters whose tensors in
+        ``named_params`` are only their data (see ``ParamMeta``).
 
         The caller validates that each bucket uses compatible placements and a
         uniform dtype. Each placement owns its per-parameter local storage layout;
@@ -473,6 +491,7 @@ class ShardedBucketStorage:
                 bucket_layout,
                 param_dtypes,
                 reduce_dtype,
+                metas or {},
             )
         else:
             param_infos, total_bytes = cls._create_param_infos_from_local_layouts(
@@ -481,6 +500,7 @@ class ShardedBucketStorage:
                 param_placements,
                 param_dtypes,
                 reduce_dtype,
+                metas or {},
             )
 
         # One collective per bucket needs one dtype. Like FSDP2, promote over
@@ -509,6 +529,7 @@ class ShardedBucketStorage:
         param_placements: dict[str, tuple[Placement, ...]],
         param_dtypes: dict[str, torch.dtype | None],
         reduce_dtype: torch.dtype | None,
+        metas: dict[str, ParamMeta],
     ) -> tuple[dict[str, ParamInfo], int]:
         rank = mesh.get_local_rank()
         world_size = mesh.size()
@@ -540,6 +561,7 @@ class ShardedBucketStorage:
                 storage_nbytes=local_storage_layout.storage_nbytes,
                 param_dtype=param_dtypes[fqn],
                 reduce_dtype=reduce_dtype,
+                meta=metas.get(fqn),
             )
 
         return param_infos, current_byte_offset
@@ -579,6 +601,7 @@ class ShardedBucketStorage:
         bucket_layout: BucketStorageLayout,
         param_dtypes: dict[str, torch.dtype | None],
         reduce_dtype: torch.dtype | None,
+        metas: dict[str, ParamMeta],
     ) -> tuple[dict[str, ParamInfo], int]:
         expected_fqns = {fqn for fqn, _ in named_params}
         actual_fqns = set(bucket_layout.param_layouts)
@@ -639,6 +662,7 @@ class ShardedBucketStorage:
                 bucket_layout=layout.bucket_layout,
                 param_dtype=param_dtypes[fqn],
                 reduce_dtype=reduce_dtype,
+                meta=metas.get(fqn),
             )
 
         return param_infos, bucket_layout.total_bytes
@@ -656,7 +680,27 @@ class ShardedBucketStorage:
         bucket_layout: BucketLayout | None = None,
         param_dtype: torch.dtype | None = None,
         reduce_dtype: torch.dtype | None = None,
+        meta: ParamMeta | None = None,
     ) -> ParamInfo:
+        if meta is not None:
+            return ParamInfo(
+                fqn=fqn,
+                global_shape=param.shape,
+                global_stride=tuple(make_contiguous_strides_for(param.shape)),
+                dtype=param.dtype,
+                param_dtype=param_dtype,
+                reduce_dtype=reduce_dtype,
+                requires_grad=meta.requires_grad,
+                placements=placements,
+                local_shape=local_shape,
+                local_numel=local_numel,
+                byte_offset=byte_offset,
+                storage_nbytes=storage_nbytes,
+                global_numel=param.numel(),
+                bucket_layout=bucket_layout,
+                has_explicit_grad_dtype=meta.has_explicit_grad_dtype,
+                grad_dtype_override=meta.grad_dtype_override,
+            )
         has_explicit_grad_dtype = param._has_grad_dtype_override
         return ParamInfo(
             fqn=fqn,
@@ -679,53 +723,6 @@ class ShardedBucketStorage:
             has_explicit_grad_dtype=has_explicit_grad_dtype,
             grad_dtype_override=param.grad_dtype if has_explicit_grad_dtype else None,
         )
-
-    def copy_params_from(
-        self,
-        named_params: list[tuple[str, nn.Parameter]],
-    ) -> None:
-        """Pack original parameter data into byte storage."""
-        my_rank = self._mesh.get_local_rank()
-        world_size = self._mesh.size()
-
-        for fqn, param in named_params:
-            info = self._param_infos[fqn]
-            info.placement.copy_param_to_storage(
-                self._byte_storage,
-                info,
-                param,
-                my_rank,
-                world_size,
-            )
-
-    def install_sharded_params(
-        self,
-        expected_device: torch.device,
-    ) -> None:
-        """Replace original module parameters with local storage views."""
-        for fqn, info in self._param_infos.items():
-            typed_view = info.placement.make_local_storage_view(
-                self._byte_storage,
-                info,
-            )
-            new_param = nn.Parameter(typed_view, requires_grad=info.requires_grad)
-            if info.has_explicit_grad_dtype:
-                new_param.grad_dtype = info.grad_dtype_override
-            if new_param.device != expected_device:
-                raise AssertionError(
-                    f"Expected sharded parameter {fqn!r} on "
-                    f"{expected_device}, but got {new_param.device}"
-                )
-            set_sharding_info(
-                new_param,
-                placements=tuple(p._api_placement() for p in info.placements),
-                global_shape=info.global_shape,
-                global_stride=info.global_stride,
-                mesh=self._mesh,
-                outer_layout=info.outer_layout,
-            )
-            for name in (fqn, *info.shared_fqns):
-                _set_param_on_module(self._module, name, new_param)
 
     @property
     def byte_storage(self) -> torch.Tensor:
@@ -931,15 +928,13 @@ class ShardedBucketStorage:
     def _runtime(self) -> tuple[BucketCommContext, BucketRuntime]:
         """This bucket's communication context and runtime, which exist once
         its storage is materialized."""
-        from .bucket_runtime import BucketCommContext
-
-        context = BucketCommContext.get(self._module, self.byte_storage.device)
-        if context is None:
+        runtime = self.runtime
+        if runtime is None or self._byte_storage.is_meta:
             raise RuntimeError(
                 "FlexShard: the bucket has no runtime until its storage is "
                 "materialized, e.g. by to_empty()."
             )
-        return context, context.bucket_runtime(self)
+        return runtime.context, runtime
 
     def set_buckets_to_forward_prefetch(
         self, buckets: list[ShardedBucketStorage]

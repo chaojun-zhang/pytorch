@@ -9,6 +9,7 @@ from __future__ import annotations
 import functools
 import os
 from contextlib import AbstractContextManager, nullcontext
+from enum import auto, Enum
 from typing import Any, TYPE_CHECKING, TypeVar
 
 import torch
@@ -61,13 +62,6 @@ def _record_copy_out_if_eager() -> AbstractContextManager[Any]:
     if torch.compiler.is_compiling():
         return nullcontext()
     return torch.profiler.record_function("FlexShard::copy_out")
-
-
-def _record_view_out_if_eager() -> AbstractContextManager[Any]:
-    """Return an eager profiler range for unshard view-out."""
-    if torch.compiler.is_compiling():
-        return nullcontext()
-    return torch.profiler.record_function("FlexShard::view_out")
 
 
 def _record_comm_if_eager(
@@ -480,3 +474,26 @@ def assign_to_hosts_then_ranks(
         host_load[host] += loads[index]
         rank_load[rank] += loads[index]
     return owners
+
+
+class TrainingState(Enum):
+    """Describes the training state of one sharded module state."""
+
+    # Transition to forward starting pre-forward until post-forward
+    FORWARD = auto()
+    # Transition to pre-backward when unsharding in backward
+    PRE_BACKWARD = auto()
+    # Transition to post-backward when resharding and reducing gradients
+    POST_BACKWARD = auto()
+    # Idle before/after forward or before pre-backward/after post-backward
+    IDLE = auto()
+
+
+def _cast_fp_tensor(dtype: torch.dtype, x: torch.Tensor) -> torch.Tensor:
+    if (
+        not isinstance(x, torch.Tensor)
+        or not torch.is_floating_point(x)
+        or x.dtype == dtype
+    ):
+        return x
+    return x.to(dtype)
