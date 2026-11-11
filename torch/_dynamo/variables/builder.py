@@ -3091,6 +3091,7 @@ class VariableBuilder:
         ):
             return DelayGraphBreakVariable(
                 source=self.source,
+                module=value,
                 msg=(
                     "Dynamo does not support RNN, GRU, or LSTM. "
                     "Set torch._dynamo.config.allow_rnn=True to enable "

@@ -65,7 +65,9 @@ from ..source import (
 from ..utils import (
     check_positional,
     check_unspec_or_constant_args,
+    get_type_mro_no_user_code,
     istype,
+    iter_mro_static_dicts,
     no_keywords,
     proxy_args_kwargs,
     raise_args_mismatch,
@@ -89,7 +91,12 @@ from .functions import (
     UserFunctionVariable,
     UserMethodVariable,
 )
-from .object_protocol import mro_attr_source, python_constant_repr_impl
+from .object_protocol import (
+    guard_mro_absent,
+    mro_attr_source,
+    mro_lookup,
+    python_constant_repr_impl,
+)
 from .user_defined import (
     call_random_fn,
     is_standard_setattr,
@@ -529,22 +536,118 @@ class UnknownVariable(VariableTracker):  # noqa: RVT001
     """
 
 
+# Builtin immutable scalar types that cannot define or acquire descriptor hooks
+# (`__get__`/`__set__`). Narrower than `common_constant_types`, which includes
+# Python dataclasses (e.g. pytree keys) whose types could gain `__get__`.
+_PLAIN_CLASS_LITERAL_TYPES = (
+    int,
+    float,
+    complex,
+    bool,
+    str,
+    bytes,
+    type(None),
+)
+
+
+def _get_plain_instance_dict(value: object) -> dict[str, Any]:
+    if mro_lookup(type(value), "__getattribute__") is not object.__getattribute__:
+        raise NotImplementedError
+    # Sources for class guards read __dict__ and __mro__; custom metaclasses
+    # can override those even when their __getattribute__ is inherited.
+    dict_descriptor: types.GetSetDescriptorType | None = None
+    for cls, namespace in iter_mro_static_dicts(type(value)):
+        if type(cls) is not type:
+            raise NotImplementedError
+        if "__dict__" not in namespace:
+            continue
+        descriptor = namespace["__dict__"]
+        if not (
+            isinstance(descriptor, types.GetSetDescriptorType)
+            and type(descriptor) is types.GetSetDescriptorType
+            and descriptor.__name__ == "__dict__"
+            and descriptor.__objclass__ is cls
+        ):
+            raise NotImplementedError
+        if dict_descriptor is None:
+            dict_descriptor = descriptor
+    if dict_descriptor is None:
+        raise NotImplementedError
+    instance_dict = dict_descriptor.__get__(value, type(value))
+    if not (isinstance(instance_dict, dict) and istype(instance_dict, dict)):
+        raise NotImplementedError
+    return instance_dict
+
+
 class DelayGraphBreakVariable(UnknownVariable):  # noqa: RVT001
     """
-    Used to insert a dummy variable in the stack to do the graph break at CALL_FUNCTION.
+    Delays a graph break until a call. When given an RNN module, ordinary
+    literal attributes can be read as guarded constants.
     """
+
+    _nonvar_fields = {"module", *UnknownVariable._nonvar_fields}
 
     def __init__(
         self,
         msg: str | None = None,
         hints: list[str] | None = None,
         callable_var: VariableTracker | None = None,
+        module: object | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.msg = msg
         self.hints = hints or []
         self.callable_var = callable_var
+        self.module = module
+
+    def const_getattr(self, tx: "InstructionTranslatorBase", name: str) -> Any:
+        if self.module is None or self.source is None:
+            return super().const_getattr(tx, name)
+        module_type = type(self.module)
+        side_effects = tx.output.side_effects
+        for obj in get_type_mro_no_user_code(module_type):
+            if obj in side_effects and side_effects.has_pending_mutation(
+                side_effects[obj]
+            ):
+                return super().const_getattr(tx, name)
+        namespace = _get_plain_instance_dict(self.module)
+        class_value = mro_lookup(module_type, name)
+        # Decline descriptors even if an instance attribute shadows them: their
+        # type can acquire descriptor methods during the traced frame.
+        if class_value is not NO_SUCH_SUBOBJ and not istype(
+            class_value, _PLAIN_CLASS_LITERAL_TYPES
+        ):
+            return super().const_getattr(tx, name)
+        value = namespace.get(name, class_value)
+        if not ConstantVariable.is_base_literal(value):
+            return super().const_getattr(tx, name)
+        install_guard(self.source.make_guard(GuardBuilder.TYPE_MATCH))
+        class_source = TypeSource(self.source)
+        # Note: ID_MATCH on __mro__/__getattribute__/__dict__ prevents guard
+        # serialization when RNN attributes are folded; call-only RNN frames
+        # do not enter const_getattr and avoid these guards.
+        install_guard(TypeMROSource(class_source).make_guard(GuardBuilder.ID_MATCH))
+        # Attribute-value guards alone can bypass descriptors on nn.Modules.
+        # Guard the lookup descriptors by identity and the class attribute by
+        # type (CONSTANT_MATCH on the AttrSource covers its value).
+        for attr, guard_fn in (
+            ("__getattribute__", GuardBuilder.ID_MATCH),
+            ("__dict__", GuardBuilder.ID_MATCH),
+            (name, GuardBuilder.TYPE_MATCH),
+        ):
+            attr_source = mro_attr_source(tx, module_type, class_source, attr)
+            if attr_source is None:
+                guard_mro_absent(
+                    tx,
+                    module_type,
+                    class_source,
+                    attr,
+                    len(get_type_mro_no_user_code(module_type)),
+                )
+            else:
+                install_guard(attr_source.make_guard(guard_fn))
+        return value
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
         if self.callable_var is None:
