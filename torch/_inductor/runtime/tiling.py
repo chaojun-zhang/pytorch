@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 
@@ -7,8 +8,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
 
 
-SUPPORTED_POINTWISE_PREFIXES = ("x", "y", "z0_")
-REDUCTION_PREFIXES = ("r0_", "r1_", "r2_")
+TRITON_LAUNCH_GRID_NDIM = 3
 
 
 def is_z_prefix(prefix: str) -> bool:
@@ -52,6 +52,14 @@ def get_pointwise_prefixes(prefixes: Iterable[str]) -> tuple[str, ...]:
     prefixes = tuple(prefixes)
     return tuple(reversed(get_z_prefixes(prefixes))) + tuple(
         p for p in ("y", "x") if p in prefixes
+    )
+
+
+def get_pointwise_block_product(
+    block_sizes: Mapping[str, int], *, exclude: str | None = None
+) -> int:
+    return math.prod(
+        block_sizes[p] for p in get_pointwise_prefixes(block_sizes) if p != exclude
     )
 
 
