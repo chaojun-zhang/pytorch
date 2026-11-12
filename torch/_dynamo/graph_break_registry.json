@@ -1211,6 +1211,16 @@
       ]
     }
   ],
+  "GB7728": [
+    {
+      "Gb_type": "DELETE_GLOBAL with a pending module-object write",
+      "Context": "name",
+      "Explanation": "Dynamo cannot order a global delete against a pending write to the module globals, whether through the module object or its __dict__.",
+      "Hints": [
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
+      ]
+    }
+  ],
   "GB0071": [
     {
       "Gb_type": "Inline attempt with __self__",
@@ -3399,6 +3409,26 @@
       "Gb_type": "Reconstruct user defined class without a source",
       "Context": "Class: {var.python_type().__name__}",
       "Explanation": "Cannot reconstruct an instance of {var.python_type().__name__} that escapes the compiled region. This happens when the class is defined dynamically (e.g., inside the compiled function) and the class object itself has no source that can be reconstructed. To fix this, move the class definition outside the compiled function or prevent the object from escaping the compiled region.",
+      "Hints": [
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
+      ]
+    }
+  ],
+  "GB1811": [
+    {
+      "Gb_type": "DELETE_GLOBAL in unregistered module globals",
+      "Context": "module_name: {self.f_globals.get('__name__')}",
+      "Explanation": "Dynamo cannot safely replay global deletes for a frame whose globals dict is not the registered module __dict__.",
+      "Hints": [
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
+      ]
+    }
+  ],
+  "GB8630": [
+    {
+      "Gb_type": "DELETE_GLOBAL in module with __getattr__",
+      "Context": "name",
+      "Explanation": "Dynamo cannot safely replay global deletes for a module that defines __getattr__.",
       "Hints": [
         "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
       ]
@@ -7137,6 +7167,16 @@
       "Hints": [
         "Use OrderedDict methods instead of raw dict writes such as dict.__setitem__(mapping, key, value).",
         "This graph break is fundamental - it is unlikely that Dynamo will ever be able to trace through your code. Consider finding a workaround."
+      ]
+    }
+  ],
+  "GB4909": [
+    {
+      "Gb_type": "DELETE_GLOBAL in non-module globals",
+      "Context": "name",
+      "Explanation": "Dynamo cannot safely replay global deletes for an inlined function whose globals dict is not the registered module __dict__.",
+      "Hints": [
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
       ]
     }
   ]

@@ -2549,6 +2549,13 @@ def generic_getattr(
 
     # Side effects: check for pending attribute mutations.
     if tx.output.side_effects.has_pending_mutation_of_attr(obj, name):
+        if isinstance(obj, variables.PythonModuleVariable):
+            value = tx.output.side_effects.load_attr(obj, name, deleted_ok=True)
+            if not isinstance(value, variables.DeletedVariable):
+                return value
+            if default is _NO_DEFAULT:
+                raise_observed_exception(AttributeError, tx)
+            return default  # type: ignore[return-value]
         if not isinstance(obj, variables.UserDefinedObjectVariable):
             value = tx.output.side_effects.load_attr(obj, name)
             # A pending store of a descriptor onto a class lands in cls.__dict__,

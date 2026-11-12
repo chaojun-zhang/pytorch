@@ -1001,6 +1001,10 @@ class SideEffects:
         return variable
 
     def track_global_existing(self, source: Source, item: object) -> VariableTracker:
+        # Re-tracks are keyed by object identity and return the vt the first
+        # call built; the source of a later call is not honored.
+        if id(item) in self.id_to_variable:
+            return self.id_to_variable[id(item)]
         variable = variables.NewGlobalVariable.create(source)
         self.id_to_variable[id(item)] = variable
         self.keepalive.append(item)
@@ -2023,15 +2027,28 @@ def _codegen_attribute_mutation(ctx: SideEffectReplayContext) -> None:
     for name, value in reversed(side_effects.store_attr_mutations.get(var, {}).items()):
         mutation_kind = side_effects.get_attr_mutation_kind(var, name)
         if isinstance(var, variables.NewGlobalVariable):
-            cg.tx.output.update_co_names(name)
-            cg(value)
             if not isinstance(var.source, GlobalSource):  # type: ignore[attr-defined]
                 raise AssertionError(
                     f"Expected GlobalSource for NewGlobalVariable, "
                     f"got {type(var.source)}"  # type: ignore[attr-defined]
                 )
-            ctx.suffixes.append([create_instruction("STORE_GLOBAL", argval=name)])
-            side_effect_occurred = True
+            if isinstance(value, variables.DeletedVariable):
+                # TODO(3.16): CPython 3.16 compiles `del name` to PUSH_NULL;
+                # STORE_GLOBAL, so emit that pair once 3.16 is supported.
+                # Through 3.15, STORE_GLOBAL would write the null as an
+                # ordinary value into the dict, so DELETE_GLOBAL must be
+                # emitted.
+                if name in cg.tx.output.global_scope:
+                    cg.tx.output.update_co_names(name)
+                    ctx.suffixes.append(
+                        [create_instruction("DELETE_GLOBAL", argval=name)]
+                    )
+                    side_effect_occurred = True
+            else:
+                cg.tx.output.update_co_names(name)
+                cg(value)
+                ctx.suffixes.append([create_instruction("STORE_GLOBAL", argval=name)])
+                side_effect_occurred = True
         elif isinstance(value, variables.DeletedVariable):
             if isinstance(var, variables.CellVariable):
                 # Cells created during inlining (no local_name) are rebuilt via
