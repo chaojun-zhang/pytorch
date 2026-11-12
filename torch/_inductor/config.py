@@ -294,6 +294,14 @@ inplace_buffers = True
 # reuse a buffer for an unrelated purpose
 allow_buffer_reuse = lite_mode_default(False, True)
 
+# Reinplace a scatter whose destination is an output of auto_functionalized(_v2),
+# i.e. a buffer that a custom op with mutates_args has already written. The
+# functional scatter would copy the whole buffer to update one region.
+# Correctness is still gated by can_inplace(). Set to False to disable.
+reinplace_mutated_base_scatters = (
+    os.environ.get("TORCHINDUCTOR_REINPLACE_MUTATED_BASE_SCATTERS", "1") == "1"
+)
+
 # Enable pooled allocations for non-output tensors
 memory_planning = os.environ.get("TORCHINDUCTOR_MEMORY_PLANNING", "0") == "1"
 
