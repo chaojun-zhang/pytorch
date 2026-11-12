@@ -8,6 +8,7 @@ import datetime
 import enum
 import functools
 import inspect
+import io
 import itertools
 import keyword
 import math
@@ -3038,6 +3039,38 @@ partial_fn = functools.partial(fn, scale=2)
 
         x = torch.randn(4)
         self.assertEqual(fn(x), opt_fn(x))
+
+    def test_union_type_hasattr(self):
+        def fn(x, t):
+            return x + 1, hasattr(t, "__name__"), hasattr(t, "__args__")
+
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        x = torch.randn(3)
+        self.assertEqual(fn(x, int | None), opt_fn(x, int | None))
+
+    def test_hasattr_caching_getattr(self):
+        # Mirrors tempfile._TemporaryFileWrapper: __getattr__ caches into
+        # __dict__, so guards must not call it while they are built.
+        class Wrapper:
+            def __init__(self):
+                self.__dict__["file"] = io.BytesIO()
+
+            def __getattr__(self, name):
+                a = getattr(self.__dict__["file"], name)
+                setattr(self, name, a)
+                return a
+
+        def fn(w, x):
+            if hasattr(w, "seek"):
+                return x + 1
+            return x - 1
+
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        x = torch.randn(3)
+        w = Wrapper()
+        self.assertEqual(opt_fn(w, x), x + 1)
+        self.assertIn("seek", w.__dict__)
+        self.assertEqual(opt_fn(w, x), x + 1)
 
     @make_test
     def test_list_clear(a, b):
