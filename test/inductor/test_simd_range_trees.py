@@ -9,6 +9,14 @@ import sympy
 from torch._inductor.codegen.simd import DerivedIterationRangesRoot, IterationRangesRoot
 from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
 from torch._inductor.codegen.triton import IndexingOptions, TritonKernel, TritonSymbols
+from torch._inductor.runtime.tiling import (
+    block_sort_key,
+    block_to_prefix,
+    get_max_block,
+    get_pointwise_prefixes,
+    get_z_prefixes,
+    pointwise_prefixes,
+)
 from torch._inductor.virtualized import V
 from torch.testing._internal.common_utils import (
     HardwareClassification,
@@ -30,6 +38,21 @@ except ImportError:
 
 class TestSIMDRangeTrees(TestCase):
     hw_classification = HardwareClassification.GENERIC
+
+    def test_numbered_pointwise_axes(self):
+        prefixes = ("z10_", "r0_", "y", "z2_", "x", "z0_")
+        self.assertEqual(get_z_prefixes(prefixes), ("z0_", "z2_", "z10_"))
+        self.assertEqual(
+            get_pointwise_prefixes(prefixes), ("z10_", "z2_", "z0_", "y", "x")
+        )
+        self.assertEqual(pointwise_prefixes(5), ("z2_", "z1_", "z0_", "y", "x"))
+        self.assertEqual(get_max_block("z10_", {"Z0_": 1024}), 1024)
+        self.assertEqual(block_to_prefix("R1_BLOCK"), "r1_")
+        self.assertEqual(block_to_prefix("Z10_BLOCK"), "z10_")
+        self.assertEqual(
+            sorted(["Z10_BLOCK", "XBLOCK", "Z2_BLOCK"], key=block_sort_key),
+            ["XBLOCK", "Z2_BLOCK", "Z10_BLOCK"],
+        )
 
     def _make_graph(self):
         return MockGraphHandler()

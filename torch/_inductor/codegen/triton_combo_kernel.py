@@ -393,7 +393,9 @@ class ComboKernel(Kernel):
 
             # Skip multi-axis reductions and 3D pointwise kernels from combo.
             keys = tiled_groups.keys()
-            if ("r0_" in keys and "r1_" in keys) or "z0_" in keys:
+            if ("r0_" in keys and "r1_" in keys) or any(
+                k.startswith("z") for k in keys
+            ):
                 all_partitions.append([node_info])
                 continue
 
