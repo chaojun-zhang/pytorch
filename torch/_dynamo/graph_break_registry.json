@@ -2029,6 +2029,16 @@
       ]
     }
   ],
+  "GB4061": [
+    {
+      "Gb_type": "Unsupported OrderedDict union result",
+      "Context": "new.python_type_name()",
+      "Explanation": "Dynamo cannot yet update a non-dictionary returned by an OrderedDict subclass constructor.",
+      "Hints": [
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
+      ]
+    }
+  ],
   "GB0119": [
     {
       "Gb_type": "Uninitialized nn.Module",
@@ -4590,6 +4600,16 @@
       "Explanation": "torch.get_device_module accepts 1 optional argument `device`",
       "Hints": [
         "Your code may result in an error when running in eager. Please double check that your code doesn't contain a similar error when actually running eager/uncompiled. You can do this by removing the `torch.compile` call, or by using `torch.compiler.set_stance(\"force_eager\")`. "
+      ]
+    }
+  ],
+  "GB3039": [
+    {
+      "Gb_type": "OrderedDict subclass allocation",
+      "Context": "OrderedDict subclass",
+      "Explanation": "Dynamo cannot trace allocating operations on OrderedDict subclasses.",
+      "Hints": [
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
       ]
     }
   ],
@@ -7341,6 +7361,26 @@
       "Explanation": "Dynamo cannot compute the hash of a builtin method without a stable receiver identity.",
       "Hints": [
         "This graph break may be difficult to debug. Please report an issue to PyTorch for assistance."
+      ]
+    }
+  ],
+  "GB0580": [
+    {
+      "Gb_type": "Dictionary mutated during iteration",
+      "Context": "str(error)",
+      "Explanation": "Dynamo cannot trace dictionary iteration that changes its keys.",
+      "Hints": [
+        "Avoid changing dictionary keys during iteration."
+      ]
+    }
+  ],
+  "GB1160": [
+    {
+      "Gb_type": "Unsupported dictionary view owner",
+      "Context": "dict_vt.python_type_name()",
+      "Explanation": "Dynamo cannot access this dictionary view's owner storage.",
+      "Hints": [
+        "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
       ]
     }
   ]

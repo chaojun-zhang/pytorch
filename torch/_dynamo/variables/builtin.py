@@ -3641,7 +3641,7 @@ class DictBuiltinVariable(BaseBuiltinVariable):
         resolved_fn = getattr(dict, name, None)
         if resolved_fn is not None and resolved_fn in dict_methods:
             obj = args[0].realize()
-            if name == "__repr__":
+            if name in (*_RICH_CMP_DUNDERS, "__repr__", "__iter__"):
                 if not isinstance(obj, ConstDictVariable):
                     unimplemented(
                         gb_type="Unsupported builtin dictionary storage operation",
