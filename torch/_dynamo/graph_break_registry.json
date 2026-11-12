@@ -1827,6 +1827,34 @@
       ]
     }
   ],
+  "GB2688": [
+    {
+      "Gb_type": "slot-wrapper identity requires receiver guards",
+      "Context": "{self}",
+      "Explanation": "Slot-wrapper identity operations require receiver guards that saved capture may filter out.",
+      "Hints": [
+        "Compare or hash slot wrappers outside the compiled region."
+      ]
+    },
+    {
+      "Gb_type": "slot-wrapper identity requires receiver guards",
+      "Context": "{self}",
+      "Explanation": "Saved slot-wrapper hashes require receiver identity guards that may be filtered out.",
+      "Hints": [
+        "Compute the hash or build the container outside the compiled region."
+      ]
+    }
+  ],
+  "GB7711": [
+    {
+      "Gb_type": "slot-wrapper comparison with undecidable identity",
+      "Context": "{self} {op} {other}",
+      "Explanation": "Dynamo cannot determine the receiver identities of these slot wrappers.",
+      "Hints": [
+        "This graph break may be difficult to debug. Please report an issue to PyTorch for assistance."
+      ]
+    }
+  ],
   "GB0111": [
     {
       "Gb_type": "TypeError from user code",
@@ -3184,6 +3212,16 @@
       ]
     }
   ],
+  "GB1551": [
+    {
+      "Gb_type": "Prebound builtin method requires identity guards",
+      "Context": "source.name",
+      "Explanation": "Dynamo cannot track this prebound builtin method when its identity guard can be skipped or filtered.",
+      "Hints": [
+        "Bind the builtin method inside the compiled function."
+      ]
+    }
+  ],
   "GB0176": [
     {
       "Gb_type": "call_id() without associated real value",
@@ -3521,6 +3559,17 @@
       "Context": "invalid args to {self_handler}: {args} {kwargs}",
       "Explanation": "Encountered TypeError when trying to handle op {fn.__name__}",
       "Hints": [
+        "This graph break may be difficult to debug. Please report an issue to PyTorch for assistance."
+      ]
+    }
+  ],
+  "GB8644": [
+    {
+      "Gb_type": "builtin method identity with unstable receiver",
+      "Context": "receiver: {obj}",
+      "Explanation": "Dynamo cannot preserve builtin method identity without a stable receiver. Resuming with a reconstructed copy can change its hash or comparisons.",
+      "Hints": [
+        "Bind the method on an input or another stable object.",
         "This graph break may be difficult to debug. Please report an issue to PyTorch for assistance."
       ]
     }
@@ -3970,6 +4019,16 @@
       "Explanation": "The type {self.python_type_name()} has an sq_inplace_repeat C slot but the corresponding VariableTracker doesn't implement sq_inplace_repeat_impl.",
       "Hints": [
         "It may be possible to write Dynamo tracing rules for this code. Please report an issue to PyTorch if you encounter this graph break often and it is causing performance issues."
+      ]
+    }
+  ],
+  "GB7856": [
+    {
+      "Gb_type": "dict storage mutation on OrderedDict",
+      "Context": "dict.{name}",
+      "Explanation": "Base dict writes bypass OrderedDict's linked storage.",
+      "Hints": [
+        "Use OrderedDict methods to preserve its linked storage."
       ]
     }
   ],
@@ -5221,6 +5280,16 @@
       "Explanation": "The attribute '{name}' does not exist on opaque class {self.value}.",
       "Hints": [
         "Ensure '{name}' is a valid attribute of {type(self.value)}."
+      ]
+    }
+  ],
+  "GB8756": [
+    {
+      "Gb_type": "Conversion of compile-time-only hash value",
+      "Context": "FakeIdVariable",
+      "Explanation": "An identity-dependent hash cannot be converted to a constant result.",
+      "Hints": [
+        "Compute the hash outside the compiled function."
       ]
     }
   ],
@@ -7196,6 +7265,34 @@
       "Hints": [
         "Use OrderedDict methods instead of raw dict writes such as dict.__setitem__(mapping, key, value).",
         "This graph break is fundamental - it is unlikely that Dynamo will ever be able to trace through your code. Consider finding a workaround."
+      ]
+    }
+  ],
+  "GB5295": [
+    {
+      "Gb_type": "builtin method hash with unstable receiver",
+      "Context": "receiver: {obj}",
+      "Explanation": "Dynamo cannot compute the hash of a builtin method without a stable receiver identity.",
+      "Hints": [
+        "Bind the method on an input or another stable object.",
+        "This graph break may be difficult to debug. Please report an issue to PyTorch for assistance."
+      ]
+    },
+    {
+      "Gb_type": "builtin method hash with unstable receiver",
+      "Context": "{self}",
+      "Explanation": "Dynamo cannot compute the hash of a builtin method without a stable receiver identity.",
+      "Hints": [
+        "Bind the method on an input or another stable object.",
+        "This graph break may be difficult to debug. Please report an issue to PyTorch for assistance."
+      ]
+    },
+    {
+      "Gb_type": "builtin method hash with unstable receiver",
+      "Context": "{self}",
+      "Explanation": "Dynamo cannot compute the hash of a builtin method without a stable receiver identity.",
+      "Hints": [
+        "This graph break may be difficult to debug. Please report an issue to PyTorch for assistance."
       ]
     }
   ]
