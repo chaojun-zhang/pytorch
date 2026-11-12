@@ -3,14 +3,18 @@
 import contextlib
 import dataclasses
 import getpass
+import gzip
 import importlib.util
 import io
+import itertools
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from collections.abc import Iterator
@@ -31,13 +35,14 @@ from torch.testing._internal.tci import machine
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
 
-from tools.ramjet import common, inputs, lineage, sync, times
+from tools.ramjet import common, inputs, lineage, logger, sync, times
+from tools.testing.test_selections import NUM_PROCS, THRESHOLD
 
 
 HAS_MODAL = importlib.util.find_spec("modal") is not None
 if HAS_MODAL:
     import tools.ramjet.__main__ as cli
-    from tools.ramjet import build, run, test, worker
+    from tools.ramjet import build, progress, run, test, worker
 
 sys.path.remove(str(REPO_ROOT))
 
@@ -50,8 +55,11 @@ GIT_ENV = {
     "GIT_COMMITTER_EMAIL": "ramjet@example.com",
 }
 RATES = {
+    "cpu_hour_cost": Decimal("0.0473"),
     "cpu_hour_cost_sandbox": Decimal("0.1419"),
+    "mem_gib_hour_cost": Decimal("0.008"),
     "mem_gib_hour_cost_sandbox": Decimal("0.024"),
+    "gpu_hour_cost_l4": Decimal("0.80"),
     "gpu_hour_cost_a10g": Decimal("1.10"),
     "gpu_hour_cost_a100_40gb": Decimal("2.10"),
     "gpu_hour_cost_a100_80gb": Decimal("2.50"),
@@ -64,9 +72,11 @@ cmake_minimum_required(VERSION 3.18)
 project(demo C)
 add_library(demo demo.c)
 """
-# Stands in for a test file: what collect reads is what its launcher prints, and
-# what tci's plugin writes of the tests it deselects. The second test's
-# parametrization is how the file was launched: its arguments and its PYTHONPATH
+# Stands in for a test file: what collect reads is what its launcher prints, what
+# tci's plugin writes of the tests it deselects, and what ramjet's writes of those
+# marked @serialTest: the second test, and one that tci deselects. The second
+# test's parametrization is how the file was launched: its arguments and its
+# PYTHONPATH
 TEST_FILE = """\
 import json
 import os
@@ -76,21 +86,123 @@ print("Running 2 items in this shard")
 print("test/test_file.py::TestFile::test_first")
 launched = [*sys.argv[1:], os.environ.get("PYTHONPATH", "no PYTHONPATH")]
 deselected = launched.pop(4).removeprefix("--tci-deselected=")
+marked = launched.pop(6).removeprefix("--ramjet-serial=")
 second = "test/test_file.py::TestFile::test_second"
 print(f"{second}[{' '.join(launched)}]")
 unmet = {"[two]": "@tci.needs(tci.gpus >= 2)", "_rocm": "@tci.only(tci.rocm)"}
 with open(deselected, "w") as file:
     json.dump({second + test: constraint for test, constraint in unmet.items()}, file)
+with open(marked, "w") as file:
+    file.write(f"{second}[{' '.join(launched)}]\\n{second}[two]")
 """
 # Stands in for the ci-metrics wrapper: in a directory outside the repository, it
-# keeps each query it is sent, and it answers all of them with the same rows
+# keeps each query it is sent, and it answers all of them with the same rows. The
+# queries come at once and the shell's printf writes a line at a time, so each is
+# added to the others in one write
 WRAPPER = """\
 #!/bin/sh
 for query; do :; done
-printf '%s\\n' "$query" >> {0}/queries
+printf '%s\\n' "$query" > {0}/query.$$
+cat {0}/query.$$ >> {0}/queries
 cat {0}/rows.json
 """
 L4 = {"accelerator": "cuda", "gpus": 1, "device": "NVIDIA L4", "gpu_memory": 22.5}
+# A test file with tests marked @serialTest, as pytest sees them
+MARKED = """\
+import pytest
+
+
+@pytest.mark.serial
+def test_alone(): ...
+
+
+def test_plain(): ...
+
+
+class TestClass:
+    @pytest.mark.serial
+    def test_alone(self): ...
+"""
+# Stands in for run_test.py in a container: its report says how it was launched, and
+# the test process it leaves behind outlives it unless its whole session is ended.
+# As torchci does while tests run, it leaves a report with a line for a run that
+# ended and one still being written, and the tests in flight: two of this piece and
+# one of another
+RUN_TEST = """\
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+options = dict(arg.split("=", 1) for arg in sys.argv[1:] if "=" in arg)
+launched = {"argv": sys.argv[1:], "cwd": os.getcwd()}
+launched["PYTHONPATH"] = os.environ.get("PYTHONPATH")
+launched["ids"] = Path(options["--nodeid-file"]).read_text()
+launched["child"] = subprocess.Popen(["sleep", "600"]).pid
+reports = Path(options["--save-torchci-reports"])
+reports.mkdir()
+(reports / "test_a-1.report.jsonl").write_text(json.dumps(launched))
+test = {"file": "test/test_a.py", "suite": "A"}
+ended = json.dumps({"type": "run", **test, "case_name": "test_one"})
+(reports / "test_a-2.report.jsonl").write_text(ended + "\\n" + ended[:9])
+flights = [("b", 9.0, reports, "test_two"), ("nn/a", 5.0, reports, "test_three")]
+for key, at, where, case in [*flights, ("c", 1.0, reports.parent / "other", "no")]:
+    cache = Path(".pytest_cache/v/cache/stepcurrent", key)
+    cache.mkdir(parents=True, exist_ok=True)
+    flight = {"path": f"{where}/a.jsonl", "started_at": at}
+    flight["test"] = {**test, "case_name": case}
+    (cache / "report_inflight").write_text(json.dumps(flight))
+print("ran", flush=True)
+time.sleep(600 if "--hang" in sys.argv else 0.5)
+sys.exit(3)
+"""
+
+
+def run_line(nodeid: str, outcome: str, said: str = "", at: int = 0) -> str:
+    """A line of a torchci report: one run of a test, at a time, and what it said."""
+    path, bracket, parameters = nodeid.partition("[")  # which may hold a :: too
+    file, *classes, case = path.split("::")
+    case += bracket + parameters
+    test = {"file": file, "suite": classes[-1] if classes else "", "case_name": case}
+    told = {"outcome": outcome, "outcome_summary": said, "started_at": at}
+    return json.dumps({"type": "run", **test, **told, "rerun_number": 0})
+
+
+def plain(text: str) -> str:
+    """What a terminal shows of the text, without the styles it names."""
+    return re.sub(r"\033\[[\d;]*m", "", text)
+
+
+def shows(written: str) -> list[str]:
+    """The rows a terminal shows once this is written to it: it follows the newlines
+    and the control sequences that move or erase, and takes no notice of the rest."""
+    rows, at, column = [""], 0, 0
+    for token in re.findall(r"\033\[\??[\d;]*[A-Za-z]|\033\][^\a]*\a|[\s\S]", written):
+        if token == "\n":
+            at, column = at + 1, 0
+            rows += [""] * (at + 1 - len(rows))
+        elif token == "\r":
+            column = 0
+        elif token.startswith("\033[") and token.endswith("A"):
+            at -= int(token[2:-1])
+        elif token == "\033[K":
+            rows[at] = rows[at][:column]
+        elif token == "\033[J":
+            rows[at:] = [rows[at][:column]]
+        elif not token.startswith("\033"):
+            rows[at] = rows[at][:column].ljust(column) + token + rows[at][column + 1 :]
+            column += 1
+    return rows
+
+
+def wait_for(test: unittest.TestCase, logs: Any, message: str) -> None:
+    """Wait for another thread to log a message, given as a regular expression."""
+    deadline = time.monotonic() + 60
+    while not any(re.fullmatch(message, r.getMessage()) for r in logs.records):
+        test.assertLess(time.monotonic(), deadline, f"never logged: {message}")
+        time.sleep(0.01)
 
 
 @contextlib.contextmanager
@@ -258,7 +370,11 @@ class TestRepo(TestCase):
         first = image_for()
         self.assertEqual((first.image_id, clones), ("im-1", [True]))
         self.write("edited.py", "a Python edit\n")
+        kept = [self.tmp / "lineage.json", *self.tmp.glob("*.inputs")]
+        for path in kept:
+            os.utime(path, (0, 0))  # old enough for a cleaner of /tmp to delete
         self.assertEqual(image_for(), first)
+        self.assertEqual([path.stat().st_mtime > 0 for path in kept], [True, True])
         self.write("lib.cpp", "int b;\n")
         self.write(".ci/docker/README.md", "a new CI image tag\n")  # same lineage
         self.assertEqual((image_for().image_id, clones), ("im-2", [True, False]))
@@ -309,25 +425,36 @@ class TestRepo(TestCase):
             self.assertEqual(times.fetch(files, "NVIDIA L4", 1), {})
 
     @unittest.skipUnless(HAS_MODAL, "needs modal")
-    def test_list_tests(self) -> None:
+    def test_run_tests(self) -> None:
         container = self.tmp / "container"  # its /pytorch, at the build image's commit
-        container.mkdir()
         sync.archive(self.base, ["."], self.tmp / "base.tar")
-        subprocess.run(["tar", "-xf", self.tmp / "base.tar"], cwd=container, check=True)
+
+        def boot() -> None:
+            shutil.rmtree(container, ignore_errors=True)
+            container.mkdir()
+            unpack = ["tar", "-xf", self.tmp / "base.tar"]
+            subprocess.run(unpack, cwd=container, check=True)
+
+        boot()
         self.edit()
         self.write("test/test_file.py", TEST_FILE)
         self.write("test/test_broken.py", "raise ImportError('no such module')\n")
-        launched = f"--use-pytest --collect-only -p {worker.TCI} -k second -v"
+        plugins = f"-p {worker.TCI} -p {worker.SERIAL}"
+        launched = f"--use-pytest --collect-only {plugins} -k second -v"
         second = "test/test_file.py::TestFile::test_second"
         nodeid = f"{second}[{launched} --verbosity=-1 no PYTHONPATH]"
         self.answer([[nodeid, 2.0, 3.0]])
         commit = sync.snapshot_tree()
 
-        def local_map(names: list[str], kwargs: Any, return_exceptions: bool) -> Any:
+        asked: list[list[str]] = []
+        lost = ConnectionError("container lost")
+
+        def local_map(calls: Any, kwargs: Any, return_exceptions: bool) -> Any:
             started = worker.Worker()  # this process stands in for the container
             started.sync()
-            lost = {"test_lost": ConnectionError("container lost")}
-            return [lost.get(n) or started.collect(n, **kwargs) for n in names]
+            asked.extend(calls)
+            for call in calls:  # Modal loses the call that names test_lost
+                yield lost if "test_lost" in call else started.collect(call, **kwargs)
 
         modal = mock.MagicMock()  # stands in for Modal
         image = modal.Image.from_id.return_value.run_commands.return_value
@@ -337,14 +464,36 @@ class TestRepo(TestCase):
             return image
 
         image.add_local_file.side_effect = add_local_file
-        new_app = modal.App.return_value
-        new_app.cls.return_value.return_value.return_value.collect.map = local_map
+        workers = modal.App.return_value.cls.return_value.return_value
+        workers.return_value.collect.map = local_map
+        for method in (workers.return_value.collect, workers.return_value.run):
+            method.get_current_stats.return_value.num_total_runners = 1
+        queue = modal.Queue.ephemeral.return_value.__enter__.return_value
+        queue.get_many.return_value = []
+
+        def local_starmap(calls: Any, **options: Any) -> Any:
+            for number, tests, told, started in calls:  # each test passes
+                self.assertIs(started, queue.object_id)
+                # One process, so run_test.py hears of less than it splits a file at
+                self.assertEqual(told, {"test_file": 300.0})
+                ids = [nodeid for group in tests.values() for nodeid in group]
+                report = "\n".join(run_line(nodeid, "passed") for nodeid in ids)
+                done = {"piece": number, "code": 0, "seconds": 9.0, "container": "ta-2"}
+                said = {"reports": {"a.jsonl": report}, "output": nothing}
+                used = {"cores": 2.0, "memory": 4096, "gpu_memory": 1024}
+                yield {**done, **said, **used}
+
+        nothing = gzip.compress(b"")
+        workers.return_value.run.starmap = local_starmap
 
         def fetch(*args: Any) -> Any:
-            new_app.run.return_value.__exit__.assert_called_once()  # containers stopped
+            # collect has run to its end, where its progress lines stop
+            names = [thread.name for thread in threading.enumerate()]
+            self.assertNotIn("ramjet-progress", names)
             return mock.DEFAULT  # what times.fetch returns
 
         modal_sets = {"PYTHONPATH": "/pkg/:/root/", "MODAL_TASK_ID": "ta-1"}
+        allows = {"procs": 3, "split": 600, "alone": ["test_other"]}
         for patcher in [
             mock.patch.object(test, "modal", modal),
             mock.patch.object(times, "fetch", wraps=times.fetch, side_effect=fetch),
@@ -352,6 +501,7 @@ class TestRepo(TestCase):
             mock.patch.object(worker, "CHANGES", str(self.tmp / "changes.tar")),
             mock.patch.object(worker, "DELETED", str(self.tmp / "deleted")),
             mock.patch.object(worker, "machine", return_value=L4),
+            mock.patch.object(worker, "allows", return_value=allows),
             mock.patch.dict(os.environ, modal_sets),
         ]:
             patcher.start()
@@ -359,16 +509,24 @@ class TestRepo(TestCase):
 
         build_image = lineage.Build("im-1", self.base, taken=0.0)
         sizes = (test.CORES_PER_GPU, test.MIB_PER_CORE)
-        resources = run.resources("L4", None, None, *sizes)
+        resources = run.resources("L4", 2, None, *sizes)
         names = {
             "test_file": ["test/test_file.py::TestFile::test_second"],
             "test_broken": ["test/test_broken.py"],
             "test_lost": ["test/test_lost.py"],
         }
         args = (build_image, commit, resources, names, ["-k", "second", "-v"], self.tmp)
+        rate, rerun = Decimal("3.60"), "ramjet --"
         with self.assertLogs(test.log, "DEBUG") as logs:
             with contextlib.redirect_stdout(io.StringIO()) as stdout:
-                self.assertEqual(test.list_tests(*args), 1)
+                self.assertEqual(test.run_tests(*args, True, rate, rerun), 1)
+        # A call names a file per core
+        self.assertEqual(asked, [["test_file", "test_broken"], ["test_lost"]])
+        # One call at a time, and no wait for pieces when listing
+        options = {"image": image, "timeout": worker.CALL_SECONDS, "gpu": "L4"}
+        options.update(cpu=2, memory=8192)
+        idle = {"scaledown_window": test.SCALEDOWN_SECONDS}
+        modal.App.return_value.cls.assert_called_with(**options, **idle)
         listed = [json.loads(line) for line in stdout.getvalue().splitlines()]
         self.assertEqual(listed, [{"nodeid": nodeid, "piece": 1}])
         messages = [record.getMessage() for record in logs.records]
@@ -384,11 +542,13 @@ class TestRepo(TestCase):
         self.assertIn("test/test_lost.py failed:", messages[5])
         self.assertIn("container lost", messages[5])
         left_out = ["left out 1 test that L4 can't run:", f"  1 with {needs}"]
-        self.assertEqual(messages[6:9], ["listed 1 test from 1 file", *left_out])
-        # CI took 2 s for the test on an L4, which is the machine it was asked about
+        self.assertEqual(messages[6:9], ["found 1 test in 1 file", *left_out])
+        # CI took 2 s for the test on an L4, which is the machine it was asked about.
+        # It is marked @serialTest, so its file starts once more to run it alone
         sources = "1 test with 1 x NVIDIA L4, 0 on other machines, 0 guessed"
-        seconds = round(test.START_SECONDS + 2 * test.SLOWDOWN)
+        seconds = round(2 * test.START_SECONDS + 2 * test.SLOWDOWN)
         planned = [
+            "test processes at once: 3, and 0 of the files alone",
             f"CI's times: {sources}",
             f"piece 1, about {seconds} s: 1 test of 1 file",
             f"1 piece: 1 container-minute, the longest about {seconds} s",
@@ -398,16 +558,28 @@ class TestRepo(TestCase):
         self.assertIn("e.device_name = 'NVIDIA L4' AND e.device_count = 1", query)
         self.assertIn("t.file IN ('test/test_file.py')", query)
         self.assertEqual(files(container), files(self.repo))  # synced first
-        options = {
-            "image": image,
-            "scaledown_window": test.SCALEDOWN_SECONDS,
-            "gpu": "L4",
-            "cpu": 4,
-            "memory": 16384,
-        }
-        new_app.cls.assert_called_once_with(**options)
-        modal.concurrent.assert_called_once_with(max_inputs=4)  # a file per core
-        modal.concurrent.return_value.assert_called_once_with(worker.Worker)
+        # Without --list the piece runs: the files that couldn't be collected still fail
+        boot()
+        with self.assertLogs(test.log, "INFO") as logs:
+            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(test.run_tests(*args, False, rate, rerun), 1)
+        self.assertEqual(stdout.getvalue(), "")  # no test failed
+        messages = [plain(record.getMessage()) for record in logs.records]
+        self.assertIn("$0.02 estimate running 1 piece on L4", messages)
+        self.assertIn("1 test: 1 passed", messages)
+        (kept,) = self.tmp.glob("test-*")
+        self.assertEqual(messages[-2:], ["logs and reports:", str(kept)])
+        saved = sorted(str(path.relative_to(kept)) for path in kept.rglob("*"))
+        self.assertEqual(saved, ["piece-1.log", "reports", "reports/a.jsonl"])
+        # The containers that collected wait for the pieces
+        idle = {"scaledown_window": test.HANDOVER_SECONDS}
+        modal.App.return_value.cls.assert_called_with(**options, **idle)
+        modal.App.return_value.cls.return_value.assert_called_with(worker.Worker)
+        # Modal ends its app on Ctrl-C and swallows it: the Ctrl-C goes on all the same
+        modal.App.return_value.run.return_value.__exit__.return_value = True
+        workers.return_value.collect.map = mock.Mock(side_effect=KeyboardInterrupt)
+        with self.assertLogs(test.log, "INFO"), self.assertRaises(KeyboardInterrupt):
+            test.run_tests(*args, False, rate, rerun)
 
     @unittest.skipUnless(HAS_MODAL, "needs modal")
     @unittest.skipUnless(shutil.which("setsid"), "needs util-linux's setsid")
@@ -553,6 +725,11 @@ class TestRun(TestCase):
         no_h100 = {k: v for k, v in RATES.items() if k != "gpu_hour_cost_h100"}
         with exits(self, "no GPU named h100"):
             run.hourly_rate(run.resources("H100", None, None), no_h100)
+        # One of test's containers bills its cores and memory as a Function
+        small = run.resources("L4", 4, 16384)
+        function = 4 * RATES["cpu_hour_cost"] + 16 * RATES["mem_gib_hour_cost"]
+        billed = run.hourly_rate(small, RATES, kind="")
+        self.assertEqual(billed, function + RATES["gpu_hour_cost_l4"])
 
     def test_idle_timeout(self) -> None:
         def idle(gpu: str | None) -> int:
@@ -657,6 +834,8 @@ class TestCli(TestCase):
         argv = ["test", *paths, "--list", "--", "-k", "linear", "--", "-x"]
         pytest_args = ["-k", "linear", "--", "-x"]
         self.assertEqual(parse(*argv), (None, *defaults[:-1], *listing, pytest_args))
+        running = ("test", False, paths)  # without --list, test runs them
+        self.assertEqual(parse("test", *paths), (None, *defaults[:-1], *running, []))
         bad = [
             [],  # no command
             ["--gpu", "L4", "--"],
@@ -670,13 +849,48 @@ class TestCli(TestCase):
             ["--python-version=3.9", "--", "ls"],
             ["--log-level=dev", "--", "ls"],
             ["test", "--list"],  # no paths
-            ["test", "test/dynamo"],  # only --list is built
+            ["test"],
             ["test", "--gpu", "L4", "--list", "test/dynamo"],  # --gpu goes before test
             ["test/dynamo"],
         ]
         for argv in bad:
             with self.subTest(argv=argv), self.assertRaises(SystemExit):
                 parse(*argv)
+
+
+class TestLogger(TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
+    def test_lines(self) -> None:
+        log, level, written = logger.log, logger.log.level, io.StringIO()
+        log.addHandler(logger._HANDLER)
+        self.addCleanup(log.removeHandler, logger._HANDLER)
+        self.addCleanup(log.setLevel, level)
+        log.setLevel("INFO")
+        # A terminal shows the log: the line that asks for it rings its bell
+        with mock.patch.object(logger.sys, "stderr") as stderr:
+            self.assertIs(logger.terminal(), stderr)
+            with logger.through(written):
+                log.info("5 tests: %s", logger.bold("1 failed"), extra=logger.RING)
+                log.info("4 passed", extra=logger.CONTINUED)
+                log.info("as it is", extra=logger.VERBATIM)
+            stderr.isatty.return_value = False
+            self.assertIsNone(logger.terminal())
+        rung, under, verbatim = written.getvalue().splitlines()
+        start = r"^\aramjet \d\d:\d\d:\d\d  info "
+        self.assertRegex(plain(rung), start + "5 tests: 1 failed$")
+        self.assertIn("\033[1m1 failed\033[0m", rung)
+        self.assertEqual(logger.MARGIN, len(plain(rung)) - len("\a5 tests: 1 failed"))
+        self.assertEqual(under, " " * logger.MARGIN + "4 passed")
+        self.assertEqual(verbatim, "as it is")
+        # No terminal shows a log that is not set up, or that stops at warnings
+        self.assertIs(logger._HANDLER.stream, sys.stderr)
+        with mock.patch.object(logger.sys, "stderr"):
+            log.setLevel("WARNING")
+            self.assertIsNone(logger.terminal())
+            log.setLevel("INFO")
+            log.removeHandler(logger._HANDLER)
+            self.assertIsNone(logger.terminal())
 
 
 @skipIfWindows(msg="ramjet runs on Linux and macOS")
@@ -725,17 +939,41 @@ class TestTest(TestCase):
             with mock.patch.multiple(worker, DELETED=nothing.name, **here):
                 started = worker.Worker()
                 started.sync()
-                # This file, launched as run_test.py launches it
-                collected = started.collect(self.THIS, ["-k", "test_names", "-v"])
-                missing = started.collect("tools/ramjet/missing", [])
+                # This file, launched as run_test.py launches it, and one not there
+                both = [self.THIS, "tools/ramjet/missing"]
+                collected, missing = started.collect(both, ["-k", "test_names", "-v"])
+                with mock.patch.object(worker, "COLLECT_SECONDS", 0.01):
+                    (slow,) = started.collect([self.THIS], [])
         ids = [f"test/{self.THIS}.py::TestTest::test_names"]
         self.assertEqual((collected["ids"], collected["error"]), (ids, ""))
         self.assertEqual(collected["left_out"], {})  # no test here has a constraint
         self.assertGreater(collected["seconds"], 0)
         read = json.loads(json.dumps(dataclasses.asdict(machine.capture())))
-        self.assertEqual(collected["machine"], read)
+        # With what run_test.py lets the machine do, which it runs this file beside
+        allowed = {"procs": NUM_PROCS, "split": THRESHOLD}
+        self.assertEqual(collected["machine"], {**read, **allowed})
+        self.assertEqual((collected["serial"], collected["alone"]), ([], False))
         self.assertEqual(missing["ids"], [])
         self.assertIn("missing.py", missing["error"])
+        gave_up = ([], "still collecting after 0.01 s")
+        self.assertEqual((slow["ids"], slow["error"]), gave_up)
+
+    def test_serial(self) -> None:
+        # pytest's plugin, as a container loads it to collect a file: it writes the
+        # tests marked @serialTest, also those that the other arguments leave out
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "test_marked.py").write_text(MARKED)
+            plugin = ["-p", worker.SERIAL, f"--ramjet-serial={tmp}/marked"]
+            pytest = [sys.executable, "-m", "pytest", "--collect-only", "-q", tmp]
+            output = {"capture_output": True, "text": True}
+            collect = [*pytest, *plugin, "-k", "plain"]
+            done = subprocess.run(collect, cwd=REPO_ROOT, **output)
+            marked = Path(tmp, "marked").read_text()
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertIn("test_marked.py::test_plain", done.stdout)
+        self.assertNotIn("test_alone", done.stdout)
+        both = ["test_marked.py::test_alone", "test_marked.py::TestClass::test_alone"]
+        self.assertEqual(marked.split("\n"), both)
 
     def test_timed(self) -> None:
         kept = {
@@ -775,46 +1013,596 @@ class TestTest(TestCase):
         self.assertEqual(logged, [f"CI's times: {sources}", guessed])
         self.assertEqual(logs.records[1].levelname, "INFO")
 
-    def test_progress(self) -> None:
-        def wait_for(message: str) -> None:
-            deadline = time.monotonic() + 60
-            while message not in [record.getMessage() for record in logs.records]:
-                self.assertLess(time.monotonic(), deadline, f"never logged: {message}")
-                time.sleep(0.01)
+    def test_meter(self) -> None:
+        spans = {0.2: "1 s", 40: "40 s", 59.6: "1 min", 359: "6 min", 3600: "1 h"}
+        spans[4350] = "1 h 12 min"
+        self.assertEqual({s: progress.span(s) for s in spans}, spans)
+        self.assertEqual(progress.clock(149.9), "2:29")
+        meter = progress.Meter("L4", Decimal("3.60"), began=0.0, asked=0.0)
+        asked = [10.0, 70.0, 100.0]
+        with mock.patch.object(progress.time, "monotonic", side_effect=asked):
+            meter.told(2, "collecting")  # after 10 s without a container
+            meter.told(1, "collecting")  # after a minute with two
+            meter.told(0, "running")  # after 30 s with one
+        self.assertEqual((meter.containers, meter.billed), (0, 150.0))
+        spent = {"waiting": 10.0, "collecting": 60.0, "running": 30.0}
+        self.assertEqual(meter.spent, spent)
+        self.assertEqual(meter.cost(100.0), "$0.15")
+        meter.containers = 2  # which bill since Modal last said
+        self.assertEqual(meter.cost(150.0), "$0.25")
+        self.assertEqual([meter.named(n) for n in range(3)], ["no L4", "1 L4", "2 L4"])
+        cpu = progress.Meter(None, Decimal("0.25"))
+        named = ["no container", "1 container", "2 containers"]
+        self.assertEqual([cpu.named(n) for n in range(3)], named)
+        # Of those the run can use now, which the two there are may be more than
+        self.assertEqual([meter.of(n) for n in (0, 1, 7)], ["2 L4", "1/1 L4", "2/7 L4"])
+        of = ["no container", "0/1 container", "0/1,500 containers"]
+        self.assertEqual([cpu.of(n) for n in (0, 1, 1500)], of)
+        strip, parts = (plain(progress.paint(row)) for row in meter.where())
+        self.assertEqual(strip, "▁" * 6 + "▂" * 35 + "▄" * 17)
+        self.assertEqual(parts, "10 s with no L4 • 1 min collecting • 30 s running")
 
-        often = mock.patch.object(test, "PROGRESS_SECONDS", 0.01)
-        collected = {"container": "ta-1"}
-        with often, self.assertLogs(test.log, "INFO") as logs:
-            with test.progress(5) as back:
-                wait_for("  no file collected yet: waiting for containers")
-                back += [collected, ConnectionError("container lost"), collected]
-                wait_for("  3 of 5 files collected by 1 container")
-                back.append({"container": "ta-2"})
-                wait_for("  4 of 5 files collected by 2 containers")
-            logged = len(logs.records)
+    def test_collecting(self) -> None:
+        def rows(state: Any, now: float, width: int = 60) -> list[str]:
+            return [plain(progress.paint(row)) for row in state.rows(now, width)]
+
+        meter = progress.Meter("L4", Decimal("1.12"), began=0.0, asked=0.0)
+        state = progress.Collecting(meter, 152, 4)
+        flat = "▁" * 60
+        waited = "Modal has given no L4 in %s            nothing billed yet"
+        self.assertEqual(rows(state, 120.0), [flat, waited % "2 min"])
+        # After TIP_SECONDS: the other GPUs CI tests on, if it tests on this one
+        free = "Ctrl-C is free while nothing runs"
+        tip = [flat, waited % "9 min", f"try --gpu A10 or T4: {free}"]
+        self.assertEqual(rows(state, 562.0), tip)
+        other = progress.Meter("H100", Decimal("4.50"), began=0.0, asked=0.0)
+        self.assertEqual(rows(progress.Collecting(other, 152, 4), 562.0)[2], free)
+        said = "Modal has given no L4 in 9 min • nothing billed yet"
+        self.assertEqual(progress.line(state, 562.0), said)
+        self.assertEqual(state.title(), "ramjet: no L4 yet")
+        self.assertFalse(state.working(562.0))
+        self.assertEqual(state.news(), (0, 0))
+        # A container, 4 files at once: 52 are back, one of them lost. The files
+        # that aren't are 25 calls, which could each have a container
+        meter.containers, meter.asked, meter.billed = 1, 900.0, 120.0
+        state.back.extend([{"ids": ["a"] * 175, "seconds": 7.5}] * 51)
+        state.back.append(ConnectionError("container lost"))
+        facts = "52 of 152 files • 8,925 tests   1/25 L4 • 3 min left • $0.04"
+        collecting = ["▄" * 20 + "▂" * 2 + "▁" * 38, facts]
+        self.assertEqual(rows(state, 901.0), collecting)
+        # A row too narrow for its facts drops the last ones, and so does a line
+        narrow = "52 of 152 files • 8,925 tests         1/25 L4 • 3 min left"
+        self.assertEqual(rows(state, 901.0, 58)[1], narrow)
+        said = "52 of 152 files • 8,925 tests • 1/25 L4 • 3 min left"
+        self.assertEqual(progress.line(state, 901.0), said)
+        self.assertEqual(state.title(), "ramjet: collecting")
+        self.assertTrue(state.working(901.0))
+        self.assertEqual(state.news(), (1, 3))
+        # On a terminal: from the log's margin to a space short of its end
+        first, under = progress.drawn(state, 901.0, 13, progress.ROWS, 83)
+        self.assertRegex(plain(first), r"^ramjet \d\d:\d\d:\d\d     ⠸ ▄{20}▂▂▁{38}$")
+        self.assertEqual(plain(under), " " * logger.MARGIN + facts)
+        wide = progress.drawn(state, 901.0, 13, progress.ROWS, 120)
+        self.assertEqual([len(plain(row)) for row in wide], [119, 119])
+        meter.containers = 0  # the mark turns only while containers work
+        self.assertRegex(plain(progress.drawn(state, 901.0, 13, 8, 80)[0]), r"   · ▄")
+        self.assertIn("   0/25 L4 • $0.04", rows(state, 901.0)[1])
+
+    def test_running(self) -> None:
+        def rows(now: float) -> list[str]:
+            return [plain(progress.paint(row)) for row in state.rows(now, 58)]
+
+        def wide(now: float, most: int = progress.ROWS, width: int = 60) -> list[str]:
+            return [plain(progress.paint(r)) for r in state.wide(now, most, width)]
+
+        wrapped = "dynamo/test_nested_graph_breaks_wrapped_once_more"
+        pieces = [
+            test.Piece(100.0, {"dynamo/test_a": ["t"] * 10}),
+            test.Piece(100.0, {"test_b": ["t"] * 19, "nn/test_c": ["t"]}),
+            test.Piece(100.0, {"dynamo/test_d": ["t"] * 30}),
+            test.Piece(100.0, {wrapped: ["t"] * 38, "test_e": ["t"], "test_f": ["t"]}),
+        ]
+        meter = progress.Meter("L4", Decimal("3.60"), began=0.0, asked=180.0)
+        meter.containers, meter.billed = 2, 100.0
+        state = progress.Running(meter, pieces)
+        self.assertEqual(state.sizes, [10, 20, 30, 40])
+        state.back.append({"piece": 1, "seconds": 80.0})
+        # A container is on a piece since it first said so; then it says how far
+        case = ("test/nn/test_c.py", "TestC", "test_case")
+        times = [0.0, 100.0, 150.0]
+        with mock.patch.object(progress.time, "monotonic", side_effect=times):
+            state.report(1, "ta-1", 0, None)
+            state.report(2, "ta-2", 0, None)
+            state.report(3, "ta-1", 0, None)
+            state.report(2, "ta-2", 15, case)
+        # The pieces that aren't back, the longest on its piece first
+        on = progress.Flight
+        flying = [on(2, 100.0, 15, case), on(3, 150.0, 0, None)]
+        self.assertEqual(state.flying(), flying)
+        # 100 s of 400 are done; 200 s run now, the piece further along first. A
+        # piece is waiting, so the time left is the work left, at the pace of the
+        # piece that is back weighed with the plan, for two containers: but no less
+        # than the newest piece needs if it takes SLOW times its plan
+        self.assertEqual(state.left(180.0), 120.0)
+        state.failed = 2
+        # The tests that have ended: a piece's 10, and 15 of a piece that runs. The
+        # two containers are of the three that the pieces not back could each have
+        expected = [
+            "▄" * 14 + "▃" * 15 + "▂" * 15 + "▁" * 14,
+            "25 of 100 tests • ✗ 2 failed   2/3 L4 • 2 min left • $0.10",
+        ]
+        self.assertEqual(rows(180.0), expected)
+        # Once all the work has started, no cell of the bar is flat
+        started = progress.bar(0.254, [(0.1865, 0.6)] * 4, 58)
+        self.assertEqual(plain(progress.paint(started)), "▄" * 14 + "▃" * 44)
+        self.assertEqual(state.title(), "ramjet 25% • 2 failed")
+        self.assertEqual(state.news(), (2, 2))
+        said = "25 of 100 tests • ✗ 2 failed • 2/3 L4 • 2 min left"
+        self.assertEqual(progress.line(state, 180.0), said)
+        # No countdown at the end
+        self.assertIn("2/3 L4 • < 1 min left", rows(300.0)[1])
+        # A row for each container on a piece: how long it has been on it, how many
+        # of its tests have ended, and the test that runs, or the piece's first file
+        containers = [
+            " 1:20 [15/20] test_c.py::TestC::test_case",
+            " 0:30 [ 0/30] test_d.py",
+        ]
+        self.assertEqual(wide(180.0), containers)
+        # As wide as the terminal at most, less a space: a name is cut at its end
+        self.assertEqual(wide(180.0, width=30)[0], " 1:20 [15/20] test_c.py::Tes…")
+        drawn = progress.drawn(state, 180.0, 0, progress.ROWS, 81)
+        under = [" " * logger.MARGIN + expected[1], *containers]
+        self.assertEqual([plain(row) for row in drawn[1:]], under)
+        # No more rows than fit: the other containers are counted
+        short = [containers[0], " " * 14 + "… and 1 more container"]
+        self.assertEqual(wide(180.0, most=1), short)
+        self.assertEqual(wide(180.0, most=0), [])
+        # Modal moves a piece to another container: the first one's row goes
+        with mock.patch.object(progress.time, "monotonic", return_value=170.0):
+            state.report(2, "ta-3", 0, None)
+            state.report(4, "ta-2", 99, None)
+        moved = [
+            " 0:30 [ 0/30] test_d.py",
+            " 0:10 [99/40] test_nested_graph_breaks_wrapped_once_more.p…",
+            " 0:10 [ 0/20] test_b.py +1",
+        ]
+        self.assertEqual(wide(180.0), moved)
+        self.assertEqual(state.tests(), (50, 100))  # no more than the piece has
+        # Nothing waits and every piece is past SLOW times its plan: no telling
+        state.back.append({"piece": 4, "seconds": 20.0})
+        self.assertIsNone(state.left(1000.0))
+        self.assertNotIn("left", rows(1000.0)[1])
+        # A container more than the pieces not back isn't counted. With every piece
+        # back, the run can use none: those there are
+        meter.containers = 3
+        self.assertIn("   2/2 L4 • $", rows(1000.0)[1])
+        state.back.extend({"piece": piece, "seconds": 20.0} for piece in (2, 3))
+        self.assertIn("   3 L4 • $", rows(1000.0)[1])
+        self.assertEqual(progress.Running(meter, pieces).working(0.0), False)
+
+    def test_block(self) -> None:
+        terminal = io.StringIO()
+        with progress.Block(terminal) as block:
+            self.assertEqual(terminal.getvalue(), "\033[?25l\033[22;2t")  # no cursor
+            block.draw(["one", "two"], "ramjet 1%")
+            drawn = terminal.getvalue()
+            self.assertEqual(shows(drawn), ["one", "two", ""])
+            self.assertIn("\033]2;ramjet 1%\a\033[?7l", drawn)  # named; rows are cut
+            block.draw(["one", "two"], "ramjet 1%")
+            self.assertEqual(terminal.getvalue(), drawn)  # the same: nothing to draw
+            block.write("a long line of the log\nand its second\n")
+            block.draw(["three"], "ramjet 1%")
+            rows = ["a long line of the log", "and its second", "three", ""]
+            self.assertEqual(shows(terminal.getvalue()), rows)
+            self.assertEqual(terminal.getvalue().count("\033]2;"), 1)
+            size = (progress.ROWS, progress.COLUMNS)  # as in 24 rows of 80
+            self.assertEqual(block.room(), size)
+        self.assertEqual(shows(terminal.getvalue()), rows[:2] + [""])
+        self.assertTrue(terminal.getvalue().endswith("\033[23;2t\033[?25h"))
+
+    def test_shown(self) -> None:
+        meter = progress.Meter("L4", Decimal("1.12"))
+        state = progress.Collecting(meter, 10, 2)
+        asked: list[int] = []
+
+        def ask() -> None:
+            asked.append(len(asked))
+            if len(asked) == 2:  # as when Modal can't be asked
+                raise ConnectionError("no answer")
+            meter.containers = min(len(asked), 3)
+
+        # No terminal: a line when there is news, and never two within APART_SECONDS
+        often = mock.patch.multiple(progress, POLL_SECONDS=0.01, APART_SECONDS=0)
+        with often, self.assertLogs(progress.log, "DEBUG") as logs:
+            with progress.shown(state, ask):
+                wait_for(self, logs, r"  0 of 10 files • 3/5 L4 • \$0\.00")
+                time.sleep(0.05)  # no line without news
+            said = [record.getMessage() for record in logs.records]
+            failed = "no word from Modal: ConnectionError('no answer')"
+            lines = ["  0 of 10 files • 1/5 L4 • $0.00", failed, said[-1]]
+            self.assertEqual(said, lines)
+            polls = len(asked)
             time.sleep(0.05)
-            self.assertEqual(len(logs.records), logged)  # it stopped with the block
+            self.assertEqual(len(asked), polls)  # it stopped with the block
+        # ... but one after QUIET_SECONDS without any
+        quiet = {"POLL_SECONDS": 0.01, "APART_SECONDS": 0, "QUIET_SECONDS": 0.03}
+        heard = self.assertLogs(progress.log, "INFO")
+        with mock.patch.multiple(progress, **quiet):
+            with heard as logs, progress.shown(state, ask):
+                deadline = time.monotonic() + 60
+                while len(logs.records) < 2:
+                    self.assertLess(time.monotonic(), deadline, "no second line")
+                    time.sleep(0.01)
+        self.assertEqual(logs.records[0].getMessage(), logs.records[1].getMessage())
+        # Modal is asked once more as the block ends
+        del asked[:]
+        with progress.shown(state, ask):
+            pass
+        self.assertEqual(asked, [0])
+        # On a terminal: the block under the log's lines, gone when it ends
+        terminal = io.StringIO()
+        logger.log.addHandler(logger._HANDLER)
+        self.addCleanup(logger.log.removeHandler, logger._HANDLER)
+        fast = mock.patch.object(progress, "FRAME_SECONDS", 0.01)
+        with fast, mock.patch.object(progress, "terminal", return_value=terminal):
+            with progress.shown(state, ask):
+                deadline = time.monotonic() + 60
+                while "0 of 10 files" not in terminal.getvalue():
+                    self.assertLess(time.monotonic(), deadline, "no block")
+                    time.sleep(0.01)
+                logger.log.error("a line")
+                line, bar, facts, _ = shows(plain(terminal.getvalue()))
+        self.assertRegex(line, r"^ramjet \d\d:\d\d:\d\d error a line$")
+        self.assertRegex(bar, r"^ramjet \d\d:\d\d:\d\d     . ▂+▁+$")
+        self.assertRegex(facts, r"^ {22}0 of 10 files +\d/5 L4 • \$0\.00$")
+        self.assertEqual(shows(plain(terminal.getvalue())), [line, ""])
+        self.assertIs(logger._HANDLER.stream, sys.stderr)
+
+    def test_calls(self) -> None:
+        workers = mock.MagicMock()  # stands in for the class on Modal
+        lost = ConnectionError("container lost")
+        names = ["test_a", "test_b", "test_c", "test_d", "test_e"]
+        first = [
+            {"container": "ta-1", "ids": ["a1", "a2"], "seconds": 4.0},
+            {"container": "ta-1", "ids": [], "seconds": 2.0},
+        ]
+        last = {"container": "ta-2", "ids": ["e1"], "seconds": 3.0}
+        collector = workers.return_value.collect
+        collector.get_current_stats.return_value.num_total_runners = 0
+
+        def collect(given: Any, **options: Any) -> Any:
+            asked = {"kwargs": {"pytest_args": ["-v"]}, "return_exceptions": True}
+            # A call names a file per core
+            calls = [names[:2], names[2:4], names[4:]]
+            self.assertEqual((given, options), (calls, asked))
+            none = r"  Modal has given no L4 in \d+ s • nothing billed yet"
+            wait_for(self, logs, none)
+            collector.get_current_stats.return_value.num_total_runners = 2
+            wait_for(self, logs, r"  0 of 5 files • 2/3 L4 • \$0\.00")
+            yield first
+            two = r"  2 of 5 files • 2 tests • 2/2 L4 • \d s left • \$0\.00"
+            wait_for(self, logs, two)
+            yield lost
+            yield [last]
+
+        collector.map = collect
+        resources = run.resources("L4", 2, None)
+        meter = progress.Meter("L4", Decimal("1.12"))
+        # A line at every poll, as if each had news
+        often = {"POLL_SECONDS": 0.01, "APART_SECONDS": 0, "QUIET_SECONDS": 0}
+        often = mock.patch.multiple(progress, **often)
+        with often, self.assertLogs(test.log, "INFO") as logs:
+            results = list(test.collect(workers, resources, names, ["-v"], meter))
+        # A lost call is lost for each file it named
+        self.assertEqual(results, [*first, lost, lost, last])
+        # Pieces: one call each, to the same containers, first done first. Each
+        # container says on a queue how far its piece is
+        long, short = {"test_a": ["a1", "a2"]}, {"test_b": ["b1"]}
+        told = {"test_a": 900.0}  # what run_test.py hears that the file takes
+        pieces = [test.Piece(9.0, long, told), test.Piece(5.0, short)]
+        state = progress.Running(meter, pieces)
+        runner = workers.return_value.run
+        stats = runner.get_current_stats.return_value
+        stats.num_total_runners = 0
+        queues = mock.patch.object(test.modal, "Queue").start()
+        self.addCleanup(mock.patch.stopall)
+        queue = queues.ephemeral.return_value.__enter__.return_value
+        queue.get_many.return_value = []
+
+        def ran(calls: Any, **options: Any) -> Any:
+            asked = {"kwargs": {"args": ["-v"]}, "return_exceptions": True}
+            started = queue.object_id
+            self.assertEqual(calls, [(1, long, told, started), (2, short, {}, started)])
+            self.assertEqual(options, {**asked, "order_outputs": False})
+            wait_for(self, logs, r"  0 of 3 tests • 0/2 L4 • \$0\.00")
+            stats.num_total_runners = 1
+            queue.get_many.return_value = [(2, "ta-1", 0, None)]
+            wait_for(self, logs, r"  0 of 3 tests • 1/2 L4 • < 1 min left • \$0\.00")
+            self.assertEqual(state.flying()[0].piece, 2)
+            yield {"piece": 2, "seconds": 4.0}
+            # The tests that have ended: the piece's, and one of the next piece
+            a2 = ("test/test_a.py", "A", "a2")
+            queue.get_many.return_value = [(1, "ta-1", 1, a2)]
+            wait_for(self, logs, r"  2 of 3 tests • 1/1 L4 • < 1 min left • \$0\.00")
+            yield lost
+
+        runner.starmap = ran
+        with often, self.assertLogs(test.log, "INFO") as logs:
+            results = list(test.run(workers, ["-v"], state))
+        self.assertEqual(results, [{"piece": 2, "seconds": 4.0}, lost])
+        queue.get_many.assert_called_with(test.QUEUE_ITEMS, block=False)
+        self.assertEqual(meter.spent.keys(), {"waiting", "collecting", "running"})
+
+    def test_outcomes(self) -> None:
+        a = "test/test_a.py::A::"
+        boom = "AssertionError: boom\n\nmore"
+        first = [
+            json.dumps({"type": "report", "schema_version": "1.0"}),
+            run_line(f"{a}test_pass", "passed"),
+            run_line(f"{a}test_fail", "failed", "AssertionError: first", at=10),
+            run_line(f"{a}test_flaky", "passed", at=21),  # after it failed, below
+            run_line(f"{a}test_flaky", "error", "RuntimeError: once", at=20),
+            run_line(f"{a}test_skip", "skipped", "no CUDA"),
+            run_line(f"{a}test_other", "failed", "not sent"),
+            run_line("test/test_a.py::test_function", "xfailed", "known"),
+            run_line("test/test_a.py::Outer::Inner::test_nested", "passed"),
+            run_line(f"{a}test_param[a::b]", "passed"),
+        ]
+        # A later process ran the failure again, and died on the test after it
+        second = [
+            run_line(f"{a}test_fail", "failed", boom, at=50),
+            run_line(f"{a}test_crash", "crashed", "exit code -6 (SIGIOT)", at=60),
+            run_line(f"{a}test_missing", "passed")[:40],
+        ]
+        reports = {"1.jsonl": "\n".join(first), "2.jsonl": "\n".join(second)}
+        sent = {
+            f"{a}test_pass": ("passed", ""),
+            f"{a}test_fail": ("failed", boom),
+            f"{a}test_flaky": ("flaky", "RuntimeError: once"),
+            f"{a}test_skip": ("skipped", "no CUDA"),
+            "test/test_a.py::test_function": ("xfailed", "known"),
+            "test/test_a.py::Outer::Inner::test_nested": ("passed", ""),
+            f"{a}test_param[a::b]": ("passed", ""),
+            f"{a}test_crash": ("crashed", "exit code -6 (SIGIOT)"),
+            f"{a}test_missing": ("not_run", ""),  # the line of its run is torn
+        }
+        self.assertEqual(test.outcomes(reports, list(sent)), sent)
+
+    def test_execute(self) -> None:
+        a, flaky = "test/test_a.py::A::", "test/test_b.py::B::test_flaky"
+        ok, bad, gone = f"{a}test_pass", f"{a}test_fail", f"{a}test_gone"
+        lost = "test/test_c.py::C::test_lost"
+        pieces = [
+            test.Piece(120.0, {"test_a": [ok, bad, gone]}),
+            test.Piece(60.0, {"test_b": [flaky]}),
+            test.Piece(30.0, {"test_c": [lost]}),
+        ]
+        alone = "python test/test_a.py A.test_fail"
+        boom = f"AssertionError: boom\n\n{test.REPRO}\n    {alone}\n\nThis message"
+        one = [run_line(ok, "passed"), run_line(bad, "failed", boom)]
+        two = [run_line(flaky, "failed", "once", at=1), run_line(flaky, "passed", at=2)]
+        told = {"a.jsonl": "\n".join(one), "b.jsonl": "\n".join(two)}
+        reports = {1: {"a.jsonl": told["a.jsonl"]}, 2: {"b.jsonl": told["b.jsonl"]}}
+        codes = {1: 1, 2: 0}
+        error = ConnectionError("container lost")
+
+        def ran(number: int, seconds: float) -> Any:
+            done = {"piece": number, "code": codes[number], "seconds": seconds}
+            output = gzip.compress(f"output {number}\n".encode())
+            told = {"reports": reports[number], "output": output}
+            # Piece 2 used more cores and memory than a container asks for
+            used = {"cores": 2.5 * number, "memory": 9000 * number, "gpu_memory": 512}
+            return {**done, **told, **used, "container": f"ta-{number}"}
+
+        workers = mock.MagicMock()
+        results = [ran(2, 50.0), error, ran(1, 130.0)]
+        runner = workers.return_value.run
+        runner.starmap.return_value = results
+        runner.get_current_stats.return_value.num_total_runners = 0
+        queues = mock.patch.object(test.modal, "Queue").start()
+        self.addCleanup(mock.patch.stopall)
+        queues.ephemeral.return_value.__enter__.return_value.get_many.return_value = []
+        meter = progress.Meter("L4", Decimal("3.60"))
+        asked = run.resources("L4", None, None, test.CORES_PER_GPU, test.MIB_PER_CORE)
+        with tempfile.TemporaryDirectory() as tmp:
+            kept = Path(tmp, "test-1")
+            work = (workers, pieces, ["-v"], kept, meter, asked, "ramjet --")
+            with self.assertLogs(test.log, "DEBUG") as logs:
+                with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                    self.assertEqual(test.execute(*work), 3)
+            saved = {str(p.relative_to(kept)): p.read_text() for p in kept.rglob("*.*")}
+        logged = [f"{r.levelname} {plain(r.getMessage())}" for r in logs.records]
+        expected = [
+            "INFO $0.21 estimate running 3 pieces on L4",
+            "DEBUG piece 2 took 50 s on container ta-2: exit code 0",
+            "DEBUG piece 2 used 5.0 cores, 18000 MiB, and 512 MiB of a GPU",
+            f"WARNING flaky: {flaky}",
+            "ERROR Modal lost a piece: ConnectionError('container lost')",
+            "DEBUG piece 1 took 130 s on container ta-1: exit code 1",
+            "DEBUG piece 1 used 2.5 cores, 9000 MiB, and 512 MiB of a GPU",
+            f"ERROR failed: {bad}",
+            "ERROR   AssertionError: boom",
+            f"ERROR piece 1 exited 1: 1 test didn't run, see {kept}/piece-1.log",
+            # What needs a look, the failures marked, and the rest under it
+            "INFO 5 tests: ✗ 1 failed • 2 not run • 1 flaky",
+            "INFO 1 passed",
+            "INFO 1 s • about $0.00 on 2 L4",
+            f"INFO {'▁' * progress.WIDTH}",  # where the time went: no container came
+            "INFO 1 s with no L4",
+            "WARNING 1 piece used more than a container's 4 cores",
+            "WARNING piece 2 the most, 5.0 cores: see --cpu",
+            "WARNING 1 piece used more than a container's 16 GiB of memory",
+            "WARNING piece 2 the most, 17.6 GiB: see --memory",
+            "INFO logs and reports:",
+            f"INFO {kept}",
+            "INFO rerun one on the warm runner:",
+            "INFO ramjet -- \\",
+            f"INFO   {alone}",
+        ]
+        self.assertEqual(logged, expected)
+        self.assertIn("\033[31m✗\033[0m \033[1m1 failed", logs.records[10].getMessage())
+        # The first failure and the totals ring the bell, and the rows that go on
+        # under a line have no start of their own
+        records = list(enumerate(logs.records))
+        ringing = [i for i, r in records if getattr(r, "ring", False)]
+        self.assertEqual(ringing, [7, 10])
+        under = [i for i, r in records if getattr(r, "continued", False)]
+        self.assertEqual(under, [11, 13, 14, 16, 18, 20, 22, 23])
+        failing = {bad: "failed", gone: "not_run", lost: "not_run"}
+        printed = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        rows = [{"nodeid": nodeid, "outcome": o} for nodeid, o in failing.items()]
+        self.assertEqual(printed, rows)
+        files = {"piece-1.log": "output 1\n", "piece-2.log": "output 2\n"}
+        kept_reports = {f"reports/{name}": report for name, report in told.items()}
+        self.assertEqual(saved, {**files, **kept_reports})
+
+        # Ctrl-C, while a piece is awaited or while one that is back is handled: the
+        # totals of the piece handled before, and the Ctrl-C goes on
+        def awaited(calls: Any, **options: Any) -> Any:
+            yield ran(2, 50.0)
+            raise KeyboardInterrupt
+
+        def handled(calls: Any, **options: Any) -> Any:
+            yield ran(2, 50.0)
+            with mock.patch.object(test, "outcomes", side_effect=KeyboardInterrupt):
+                yield ran(1, 130.0)
+
+        for starmap, used in ((awaited, 1), (handled, 2)):
+            runner.starmap = starmap
+            with tempfile.TemporaryDirectory() as tmp:
+                work = (workers, pieces, ["-v"], Path(tmp, "out"), meter, asked)
+                with self.assertLogs(test.log, "INFO") as logs:
+                    with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                        with self.assertRaises(KeyboardInterrupt):
+                            test.execute(*work, "ramjet --")
+            logged = [f"{r.levelname} {plain(r.getMessage())}" for r in logs.records]
+            stopped = [
+                f"WARNING flaky: {flaky}",
+                "WARNING stopped by Ctrl-C: 4 of 5 tests did not run",
+                "INFO 1 test: 1 flaky",
+                f"INFO 1 s • about $0.00 on {used} L4",
+            ]
+            self.assertEqual(logged[1:5], stopped)
+            self.assertEqual(logged[-2], "INFO logs and reports:")
+            self.assertEqual(stdout.getvalue(), "")  # of those, none failed
+            self.assertFalse(any(getattr(r, "ring", False) for r in logs.records))
+
+    def test_run_piece(self) -> None:
+        tests = {"test_a": ["a1", "a2"], "nn/test_b": ["b1"]}
+        told = {"test_a": 1500.0, "nn/test_b": 300.0}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / "test").mkdir()
+            (root / "test/run_test.py").write_text(RUN_TEST)
+            there = {"ROOT": str(root), "DISABLED": "print('fetched', flush=True)"}
+            modal_sets = {"PYTHONPATH": "/pkg/:/root/", "MODAL_TASK_ID": "ta-9"}
+            there["TELL_SECONDS"] = 0.1
+            there["GPU_MEMORY"] = "echo 512 4096"  # stands in for nvidia-smi
+            queues = mock.patch.object(worker.modal, "Queue")
+            with mock.patch.multiple(worker, **there), queues as queue:
+                with mock.patch.dict(os.environ, modal_sets):
+                    started = worker.Worker()
+                    ran = started.run(3, tests, told, "qu-1", ["-k", "x"])
+                    # run_test.py reads the files' times where CI keeps them
+                    known = json.loads((root / worker.TIMES).read_text())
+                    self.assertEqual(known, {"default": {"default": told}})
+                    # The container says on the queue that it starts the piece, and
+                    # then how far it is: a test has ended, and of those that run,
+                    # this one started first
+                    queue.from_id.assert_called_once_with("qu-1")
+                    flying = ("test/test_a.py", "A", "test_three")
+                    put = queue.from_id.return_value.put
+                    said = [call.args[0] for call in put.call_args_list]
+                    self.assertEqual(said[0], (3, "ta-9", 0, None))
+                    self.assertEqual(said[-1], (3, "ta-9", 1, flying))
+                    put.assert_called_with(said[-1], block=False)
+                    # One that hangs is given up on, with every process it started,
+                    # and one that can't say how far it is runs all the same
+                    put.side_effect = ConnectionError("no queue")
+                    with mock.patch.object(worker, "GIVE_UP_SECONDS", 2):
+                        hung = started.run(4, tests, told, "qu-1", ["--hang"])
+        self.assertEqual((ran["piece"], ran["code"], ran["container"]), (3, 3, "ta-9"))
+        self.assertEqual(gzip.decompress(ran["output"]), b"fetched\nran\n")
+        self.assertGreater(ran["seconds"], 0)
+        # What the piece used: memory is the machine's, as a container reads its own
+        self.assertGreater(ran["memory"], 0)
+        self.assertGreaterEqual(ran["cores"], 0)
+        self.assertEqual(ran["gpu_memory"], 4096)
+        launched = json.loads(ran["reports"]["test_a-1.report.jsonl"])
+        ours, theirs = launched["argv"][:6], launched["argv"][6:]
+        reports = ours.pop(2).removeprefix("--save-torchci-reports=")
+        self.assertEqual(Path(reports).name, "reports")
+        named = ["--keep-going", "--pipe-logs", "-i", "test_a", "nn/test_b"]
+        self.assertEqual(ours, named)
+        ids = theirs.pop(1).removeprefix("--nodeid-file=")
+        self.assertEqual(Path(ids).parent, Path(reports).parent)
+        lists = ["--", "--import-slow-tests", "--import-disabled-tests", "-k", "x"]
+        self.assertEqual(theirs, lists)
+        self.assertEqual(launched["ids"], "a1\na2\nb1")
+        self.assertEqual((launched["cwd"], launched["PYTHONPATH"]), (str(root), None))
+        self.assertEqual((hung["piece"], hung["code"]), (4, None))
+        # A container fetches CI's list of disabled tests once
+        self.assertEqual(gzip.decompress(hung["output"]), b"ran\n")
+        left = json.loads(hung["reports"]["test_a-1.report.jsonl"])["child"]
+        deadline = time.monotonic() + 60
+        while Path(f"/proc/{left}").exists():  # the kernel takes a moment to end it
+            self.assertLess(time.monotonic(), deadline, "the piece's process lives on")
+            time.sleep(0.01)
 
     def test_shard(self) -> None:
-        start = test.START_SECONDS
+        start, split = test.START_SECONDS, 600
+        # CI's plugin, which gives each test of a file to one of its processes
+        path = REPO_ROOT / "test/pytest_shard_custom.py"
+        spec = importlib.util.spec_from_file_location("pytest_shard_custom", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        shards = module.PytestShardPlugin(None)
+
+        def pick(name: str, hashes: list[int]) -> list[str]:
+            """A node id of the file for each hash, as its remainder by 6: by 3 and
+            by 2, the process of three and of two that CI's plugin gives it."""
+            ids = (f"test/{name}.py::T::test_{n}" for n in itertools.count())
+            items = (mock.Mock(nodeid=nodeid) for nodeid in ids)
+            kept = shards.filter_items_by_shard
+            mine = (next(i for i in items if kept([i], h + 1, 6)) for h in hashes)
+            return [item.nodeid for item in mine]
+
+        big, two = pick("big", [0, 1, 2, 3, 4, 5]), pick("two", [0, 1])
         timed = {
-            "big": [(f"big::{n}", 40.0) for n in range(10)],  # three fit in a piece
-            "small": [("small::0", 10.0), ("small::1", 10.0)],
-            "medium": [("medium::0", 100.0)],
+            "big": [(nodeid, 100.0) for nodeid in big],  # three processes, twice
+            "two": [(nodeid, 100.0) for nodeid in two],  # two processes
+            "a": [("a::0", 100.0)],
+            "b": [("b::0", 60.0)],
+            "c": [("c::0", 30.0)],
+            "solo": [("solo::0", 15.0), ("solo::1", 15.0)],
             "huge": [("huge::0", 400.0)],  # longer than a piece
         }
-        pieces = test.shard(timed)
-        planned = [(round(p.seconds - start * len(p.tests)), p.tests) for p in pieces]
+        pieces = test.shard(timed, ["solo"], {}, 3, split)
+        planned = [(round(p.seconds - start, 1), p.tests, p.times) for p in pieces]
+        one, three = split / 2, 2.5 * split  # what run_test.py hears a file takes
+        solo = {"solo": ["solo::0", "solo::1"]}
         expected = [
-            (400, {"huge": ["huge::0"]}),
-            # small goes to the first piece with room for it, of the longest first
-            (120, {"medium": ["medium::0"], "small": ["small::0", "small::1"]}),
-            (120, {"big": ["big::0", "big::1", "big::2"]}),
-            (120, {"big": ["big::3", "big::4", "big::5"]}),
-            (120, {"big": ["big::6", "big::7", "big::8"]}),
-            (40, {"big": ["big::9"]}),
+            (400.0, {"huge": ["huge::0"]}, {"huge": one}),
+            # run_test.py starts the processes in the order of their files' names,
+            # three at once: c takes the place of the first of big's that ends
+            (130.0 + start, {"big": big[:3], "c": ["c::0"]}, {"big": three, "c": one}),
+            # solo runs alone, once big's processes have ended
+            (130.0 + start, {"big": big[3:], **solo}, {"big": three, "solo": one}),
+            # b would keep the second of two's processes waiting
+            (100.0, {"two": two, "a": ["a::0"]}, {"two": 1.5 * split, "a": one}),
+            (60.0, {"b": ["b::0"]}, {"b": one}),
         ]
         self.assertEqual(planned, expected)
+        # Tests marked @serialTest run after the others, alone: big starts once more
+        # for each of its processes that has one, here the second and the third,
+        # whether the test is of this piece or not
+        short, elsewhere = big[4], big[5]
+        tests = [*timed["big"][:3], (short, 5.0)]
+        marked = {"big": {short, elsewhere}}
+        (piece,) = test.shard({"big": tests}, [], marked, 3, split)
+        self.assertEqual(round(piece.seconds, 1), round(100.0 + 3 * start + 5.0, 1))
+        self.assertEqual(piece.tests, {"big": [*big[:3], short]})
+        self.assertEqual(piece.times, {"big": three})
 
 
 if __name__ == "__main__":
