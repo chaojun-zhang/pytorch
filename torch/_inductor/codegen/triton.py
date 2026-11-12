@@ -12,6 +12,7 @@ import logging
 import math
 import operator
 import os
+import re
 import textwrap
 from abc import abstractmethod
 from collections.abc import Callable, Iterable, Sequence
@@ -65,6 +66,7 @@ from ..runtime.hints import (
     TritonMeta,
 )
 from ..runtime.runtime_utils import get_max_y_grid, next_power_of_2
+from ..runtime.tiling import get_max_block
 from ..scheduler import (
     BaseSchedulerNode,
     FusedExternTritonKernelSchedulerNode,
@@ -370,7 +372,7 @@ class TritonSymbols:
     ) -> bool:
         if (node := kernel.range_tree_nodes.get(symbol)) is not None:
             return node.root.is_reduction
-        return symbol_is_type(symbol, cls.reduction_types)
+        return re.match(r"r\d+_", symbol.name.lower()) is not None
 
     @classmethod
     def has_reduction_index_symbol(cls, kernel: TritonKernel, expr: sympy.Expr) -> bool:
@@ -574,19 +576,15 @@ class BlockDescriptorOptions:
         result.compute_boundary_check(get_max_block, range_trees)
         return result
 
-    def replace_offset(
-        self, expr: sympy.Expr, replacement: sympy.Expr, symt: SymT
-    ) -> sympy.Expr:
-        """
-        Replaces instances of {symt}_offset with the new expression.
-        """
-        roffset = TritonSymbols.block_offsets[symt]
-        return sympy_subs(expr, {roffset: replacement})
-
     def remove_roffsets(self, expr: sympy.Expr) -> sympy.Expr:
-        for symt in TritonSymbols.reduction_types:
-            expr = self.replace_offset(expr, sympy.Integer(0), symt)
-        return expr
+        return sympy_subs(
+            expr,
+            {
+                TritonSymbols.get_block_offset(tree): sympy.S.Zero
+                for tree in V.kernel.range_trees
+                if tree.is_reduction
+            },
+        )
 
     def compute_boundary_check(
         self,
@@ -599,7 +597,7 @@ class BlockDescriptorOptions:
         # Substitute maximum block sizes in shape expressions.
         # This works in multiple_of checks because block sizes are powers of 2.
         block_to_max: dict[sympy.Expr, Any] = {
-            TritonSymbols.block_sizes[t.symt]: get_max_block(prefix_str[t.symt])
+            TritonSymbols.get_block_size(t): get_max_block(t.prefix)
             for t in range_trees
         }
 
@@ -817,20 +815,6 @@ class TensorDescriptorOptions(BlockDescriptorOptions):
 
 @dataclasses.dataclass
 class BlockPtrOptions(BlockDescriptorOptions):
-    def replace_offset(
-        self, expr: sympy.Expr, replacement: sympy.Expr, symt: SymT
-    ) -> sympy.Expr:
-        """
-        Replaces instances of {symt}_offset with the new expression.
-        """
-        roffset = TritonSymbols.block_offsets[symt]
-        return sympy_subs(expr, {roffset: replacement})
-
-    def remove_roffsets(self, expr: sympy.Expr) -> sympy.Expr:
-        for symt in TritonSymbols.reduction_types:
-            expr = self.replace_offset(expr, sympy.Integer(0), symt)
-        return expr
-
     def format(self, name: str, roffset=True) -> str:
         """
         Codegen a call to tl.make_block_ptr()
@@ -860,7 +844,7 @@ class BlockPtrOptions(BlockDescriptorOptions):
         ]
         return f"tl.make_block_ptr({', '.join(args)})"
 
-    def advance_roffset(self, symt: SymT) -> sympy.Expr:
+    def advance_roffset(self, tree: IterationRangesRoot) -> list[sympy.Expr]:
         """
         Codegen string to pass to tl.advance(name, ...).
 
@@ -869,15 +853,13 @@ class BlockPtrOptions(BlockDescriptorOptions):
         Since we expect rN_offset to vary in range(0, rN_numel, RN_BLOCK), the first
         iteration has rN_offset=0, while the second has rN_offset=RN_BLOCK.
         """
-        rblock = TritonSymbols.block_sizes[symt]
-        advance = [
-            (
-                self.replace_offset(offset, rblock, symt)
-                - self.replace_offset(offset, sympy.S.Zero, symt)
-            )
+        rblock = TritonSymbols.get_block_size(tree)
+        roffset = TritonSymbols.get_block_offset(tree)
+        return [
+            sympy_subs(offset, {roffset: rblock})
+            - sympy_subs(offset, {roffset: sympy.S.Zero})
             for offset in self.offsets
         ]
-        return advance
 
 
 def triton_shape_dims(shape: Sequence[sympy.Expr | int | str]) -> list[str]:
@@ -3383,23 +3365,24 @@ class TMACompatibilityChecker:
             )
             return False
 
-        innermost_block_type = None
-        innermost_block_symt = None
-        for block_type_str in innermost_block_shape.free_symbols:
-            for block_symt in TritonSymbols.block_types:
-                if symbol_is_type(block_type_str, block_symt):
-                    innermost_block_type = block_type_str
-                    innermost_block_symt = block_symt
-                    break
-
-        if not (innermost_block_type and innermost_block_symt):
+        innermost_tree = next(
+            (
+                tree
+                for tree in self.kernel.range_trees
+                if TritonSymbols.get_block_size(tree)
+                in innermost_block_shape.free_symbols
+            ),
+            None,
+        )
+        if innermost_tree is None:
             raise AssertionError(
-                f"{innermost_block_shape} expr must contain a single block type from {TritonSymbols.block_types}"
+                f"{innermost_block_shape} expr must contain a block size from a range tree"
             )
+        innermost_block_type = TritonSymbols.get_block_size(innermost_tree)
 
         if (
             self.kernel.features.strict_reduction_rblock() == 1
-            and innermost_block_symt in TritonSymbols.reduction_types
+            and innermost_tree.is_reduction
         ):
             log.debug(
                 "%s strict reduction linear accumulation requires a reduction block size of 1",
@@ -3411,34 +3394,15 @@ class TMACompatibilityChecker:
         # Only apply this logic when the innermost block is a reduction block;
         # persistent reductions can still have pointwise-style loads where the innermost block is X/Y/Z,
         # and in that case we should fall back to the generic analysis below.
-        if (
-            self.kernel.persistent_reduction
-            and innermost_block_symt in TritonSymbols.reduction_types
-        ):
+        if self.kernel.persistent_reduction and innermost_tree.is_reduction:
             # For a discontiguous tensor, a 1D block will be split across several
             # dimensions, e.g. R0_BLOCK:
             # block_shape=[XBLOCK, ((R0_BLOCK + 31)//32), Min(1, ((R0_BLOCK + 31)//32)), Min(32, R0_BLOCK)]
             # The persistent R0_BLOCK will be a power of 2 that is at least r0_numel So it
             # should be guaranteed that Min(32, R0_BLOCK) * element_size >= 16
-            innermost_tree_prefix = prefix_str[innermost_block_symt]
-            tree_numel = None
-            for t in self.kernel.range_trees:
-                if t.is_reduction and t.prefix == innermost_tree_prefix:
-                    tree_numel = t.numel
-                    break
-            if tree_numel is None:
-                # If we can't map the innermost reduction block type to a reduction range tree,
-                # we cannot determine the persistent RBLOCK value,
-                # so we cannot validate the 16-byte innermost-dimension requirement for TMA.
-                # Treat this as incompatible rather than asserting during compilation, fallback to non-TMA loads.
-                log.debug(
-                    "%s could not find reduction range tree for innermost prefix %s Block shape: %s",
-                    self.failed_debug_prefix,
-                    innermost_tree_prefix,
-                    block_params.block_shape,
-                )
-                return False
-            persistent_rblock = self.kernel._get_persistent_reduction_block(tree_numel)
+            persistent_rblock = self.kernel._get_persistent_reduction_block(
+                innermost_tree.numel
+            )
             innermost_block_bytes = (
                 innermost_block_shape.subs({innermost_block_type: persistent_rblock})
                 * element_size
@@ -3487,7 +3451,7 @@ class TMACompatibilityChecker:
 
                 if (
                     self.kernel.mix_order_reduction is True
-                    and innermost_block_symt == SymT.XBLOCK
+                    and innermost_tree.prefix == "x"
                     and (
                         self.kernel.rsplit_size % min_block_size != 0
                         or (
@@ -3505,9 +3469,7 @@ class TMACompatibilityChecker:
                     return False
 
                 # TODO: min block size may be too large / introduce redundancy
-                if min_block_size > self.kernel.max_block(
-                    prefix_str[innermost_block_symt]
-                ):
+                if min_block_size > self.kernel.max_block(innermost_tree.prefix):
                     log.debug(
                         "%s the minimum block size to satisfy expression %s is too large: %d",
                         self.failed_debug_prefix,
@@ -3521,7 +3483,7 @@ class TMACompatibilityChecker:
                 # required size exceeds 1.
                 if (
                     self.kernel.no_x_dim
-                    and innermost_block_symt == SymT.XBLOCK
+                    and innermost_tree.prefix == "x"
                     and min_block_size > 1
                 ):
                     log.debug(
@@ -3538,7 +3500,7 @@ class TMACompatibilityChecker:
                 if (
                     self.kernel.is_combo_kernel
                     and not self.kernel.per_subkernel_blocks
-                    and innermost_block_symt == SymT.XBLOCK
+                    and innermost_tree.prefix == "x"
                     and min_block_size > 1
                 ):
                     log.debug(
@@ -3654,7 +3616,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.block_ptr_id = itertools.count()
         self.block_ptr_to_buffer = dict[str, str]()
         self.helper_functions = HelperFunctions()
-        self.pointer_advancements: dict[SymT, dict[str, list[sympy.Expr]]] = (
+        self.pointer_advancements: dict[str, dict[str, list[sympy.Expr]]] = (
             collections.defaultdict(dict)
         )
         self._tma_min_block_sizes_by_buffer: dict[str | None, dict[str, int]] = {}
@@ -3827,6 +3789,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @staticmethod
     def _trace_symbol_prefix(symbol: sympy.Symbol) -> str | None:
+        nd_prefix = re.match(r"[rz]\d+_", symbol.name.lower())
+        if nd_prefix:
+            return nd_prefix.group()
         for symt in (
             SymT.XBLOCK,
             SymT.YBLOCK,
@@ -3924,8 +3889,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             )
         )
 
-    @staticmethod
-    def _has_stride1_on_rdim(index) -> bool:
+    def _has_stride1_on_rdim(self, index) -> bool:
         # These analysis is only needed in deterministic mode so far
         # to filter triton configs. Return false immediately to avoid
         # increasing compilation time when the mode is off.
@@ -3937,7 +3901,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         reduce_vars = [
             var
             for var in support_vars
-            if symbol_is_type(var, TritonSymbols.reduction_types)
+            if TritonSymbols.is_reduction_index_symbol(self, var)
         ]
 
         if len(reduce_vars) == 0:
@@ -4883,13 +4847,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     # out-of-bounds. The emit site below drops pure no-op
                     # advances so this does not add codegen noise for
                     # pointers that are truly constant across all levels.
-                    for symt in TritonSymbols.reduction_types:
-                        advance_offsets = indexing.advance_roffset(symt)
+                    for tree in self.range_trees:
+                        if not tree.is_reduction:
+                            continue
+                        advance_offsets = indexing.advance_roffset(tree)
 
-                        advancements = self.pointer_advancements[symt]
+                        advancements = self.pointer_advancements[tree.prefix]
                         if block_descriptor in advancements:
                             raise AssertionError(
-                                f"duplicate advancement for pointer '{block_descriptor}' at type '{symt}'"
+                                f"duplicate advancement for pointer '{block_descriptor}' at prefix '{tree.prefix}'"
                             )
                         advancements[block_descriptor] = advance_offsets
         else:
@@ -7679,13 +7645,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 with self.body.indent(offset=level + 1):
                     # Advance pointers at the end of each loop.
                     for block_ptr, advancement in self.pointer_advancements[
-                        tree.symt
+                        tree.prefix
                     ].items():
                         # Subtract any advancements made in the previous loop level.
                         if level < len(loop_trees) - 1:
                             prev_tree = loop_trees[level + 1]
                             prev_advancements = self.pointer_advancements[
-                                prev_tree.symt
+                                prev_tree.prefix
                             ]
                             if block_ptr in prev_advancements:
                                 prev_advancement = prev_advancements[block_ptr]
@@ -8747,7 +8713,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         block = f"{prefix.upper()}BLOCK"
         if self.fixed_config and block in self.fixed_config:
             return self.fixed_config[block]
-        return TRITON_MAX_BLOCK[prefix.upper()]
+        return get_max_block(prefix, TRITON_MAX_BLOCK)
 
     def _has_constant_mask(self, tree: IterationRangesRoot) -> bool:
         if not tree.supports_constant_mask():
@@ -8829,10 +8795,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     @cache_on_self
     def get_reduction_prefixes(self) -> list[str]:
-        return [
-            prefix_str[symt]
-            for symt in list(TritonSymbols.reduction_types)[: self.num_reduction_dims]
-        ]
+        return [tree.prefix for tree in self.range_trees if tree.is_reduction]
 
     def codegen_reduction_numels(self, buffer: IndentedBuffer) -> None:
         """
