@@ -27,9 +27,10 @@ from collections.abc import Callable, Iterator
 from typing import Any, cast, TYPE_CHECKING, Union
 from typing_extensions import TypeIs
 
+from torch._guards import TracingContext
 from torch.utils._pytree import MappingKey
 
-from .. import graph_break_hints, polyfills, variables
+from .. import config, graph_break_hints, polyfills, variables
 from ..bytecode_transformation import (
     create_call_function,
     create_call_method,
@@ -47,9 +48,11 @@ from ..exc import (
 from ..guards import GuardBuilder, install_guard
 from ..source import (
     AttrSource,
+    ConstDictKeySource,
     DictGetItemSource,
     is_constant_source,
     is_from_local_source,
+    Source,
     TypeDictSource,
 )
 from ..utils import (
@@ -227,6 +230,10 @@ class ConstDictVariable(VariableTracker):  # noqa: RVT001
         # dicts. Both forms re-enter this same instance's is_python_constant, so
         # a per-instance flag suffices.
         self._checking_python_constant = False
+
+    def materialize_keys(self) -> dict[HashableTracker, VariableTracker]:
+        """Specialize deferred keys and return storage for a detached container."""
+        return self.items
 
     def as_proxy(self) -> dict[Any, Any]:
         return {k.vt.as_proxy(): v.as_proxy() for k, v in self.items.items()}
@@ -855,7 +862,7 @@ class ConstDictVariable(VariableTracker):  # noqa: RVT001
                 # NB - Guard on all the keys of the other dict to ensure
                 # correctness.
                 other.install_dict_keys_match_guard()
-                self._update_items(other.items)
+                self._update_items(other.materialize_keys())
             elif (
                 isinstance(
                     other,
@@ -1031,6 +1038,9 @@ class ConstDictVariable(VariableTracker):  # noqa: RVT001
     ) -> ConstantVariable:
         # dict not allow setting arbitrary attributes.  OrderedDict and
         # defaultdict allow arbitrary setattr, but not deletion of default attrs
+        # Hook dictionaries defer type guards until their type is observable.
+        if self.source and not is_constant_source(self.source):
+            install_guard(self.make_guard(GuardBuilder.TYPE_MATCH))
         cls = self.python_type()
         if any(
             cls is t for t in (dict, collections.OrderedDict, collections.defaultdict)
@@ -1388,20 +1398,176 @@ class MappingProxyVariable(VariableTracker):  # noqa: RVT001
         return super().call_obj_hasattr(tx, name)
 
 
-class NNModuleHooksDictVariable(OrderedDictVariable):
-    # Special class to avoid adding any guards on the nn module hook ids.
-    # nn.Module hook dicts are OrderedDict, so back storage/reconstruct with it.
-    def install_dict_keys_match_guard(self) -> None:
-        pass
+class NNModuleHooksDictVariable(ConstDictVariable):
+    # Defer local hook-ID guards so equivalent modules can reuse hook dispatch.
+    def _guard_type(self) -> None:
+        if self.source:
+            install_guard(self.make_guard(GuardBuilder.TYPE_MATCH))
 
-    def install_dict_contains_guard(
+    def call_method(
         self,
         tx: "InstructionTranslatorBase",
-        key: HashableTracker,
-        *,
-        key_present: bool | None = None,
-    ) -> None:
-        pass
+        name: str,
+        args: list[VariableTracker],
+        kwargs: dict[str, VariableTracker],
+    ) -> VariableTracker:
+        if name in ("pop", "popitem", "move_to_end"):
+            self._guard_type()
+        return super().call_method(tx, name, args, kwargs)
+
+    def is_python_constant(self) -> bool:
+        return not self.items
+
+    def install_dict_keys_match_guard(self) -> None:
+        if self.source and not is_constant_source(self.source):
+            install_guard(self.make_guard(GuardBuilder.SEQUENCE_LENGTH))
+
+    def _hashable_key(self, key: VariableTracker) -> HashableTracker:
+        self.materialize_keys()
+        return super()._hashable_key(key)
+
+    def _store_item(self, key: HashableTracker, value: VariableTracker) -> None:
+        self._guard_type()
+        self.materialize_keys()
+        super()._store_item(key, value)
+
+    def _update_items(self, items: dict[HashableTracker, VariableTracker]) -> None:
+        self._guard_type()
+        self.materialize_keys()
+        super()._update_items(items)
+
+    def tp_repr_impl(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        self._guard_type()
+        self.materialize_keys()
+        return super().tp_repr_impl(tx)
+
+    def materialize_keys(self) -> dict[HashableTracker, VariableTracker]:
+        # Key lookups, mutations and detached copies can observe IDs without
+        # comparing every stored key. Ordinary hook iteration keeps them lazy.
+        for key in self.items:
+            key.vt.realize()
+        return self.items
+
+    def clone(self, **kwargs: Any) -> VariableTracker:
+        if self.source is not None and kwargs.get("source", self.source) is None:
+            self._guard_type()
+            self.materialize_keys()
+        return super().clone(**kwargs)
+
+    def _new_dict(
+        self, items: dict[HashableTracker, VariableTracker]
+    ) -> "ConstDictVariable":
+        self._guard_type()
+        self.materialize_keys()
+        cls = (
+            OrderedDictVariable
+            if isinstance(self, OrderedDictVariable)
+            else ConstDictVariable
+        )
+        return cls(items, mutation_type=ValueMutationNew())
+
+
+class NNModuleHooksOrderedDictVariable(NNModuleHooksDictVariable, OrderedDictVariable):
+    pass
+
+
+class _NNModuleHookFlagsDictVariable(ConstDictVariable):
+    GLOBAL_FLAGS = False
+
+    _nonvar_fields = {
+        "_hook_flag_keys",
+        "_hook_flag_keys_checked",
+        "_hook_membership_sources",
+        *ConstDictVariable._nonvar_fields,
+    }
+
+    def __init__(self, items: Any, **kwargs: Any) -> None:
+        kwargs.pop("_hook_flag_keys", None)
+        kwargs.pop("_hook_flag_keys_checked", None)
+        kwargs.pop("_hook_membership_sources", None)
+        super().__init__(items, **kwargs)
+        self._hook_flag_keys: frozenset[int] | None = None
+        self._hook_flag_keys_checked = False
+        self._hook_membership_sources: set[Source] = set()
+
+    def sq_contains_impl(
+        self, tx: "InstructionTranslatorBase", item: VariableTracker
+    ) -> VariableTracker:
+        source = item.source
+        if (
+            isinstance(source, ConstDictKeySource)
+            and isinstance(source.base, AttrSource)
+            and source.base.member in ("_forward_hooks", "_forward_pre_hooks")
+            and self.source is not None
+            and (
+                self.GLOBAL_FLAGS
+                or isinstance(self.source, AttrSource)
+                and source.base.base == self.source.base
+            )
+            and not tx.output.side_effects.is_modified(self)
+        ):
+            key = _get_literal_key(item)
+            if not self._hook_flag_keys_checked:
+                self._hook_flag_keys_checked = True
+                keys = [_get_literal_key(k.vt) for k in self.items]
+                if all(type(k) is int for k in keys):
+                    self._hook_flag_keys = frozenset(keys)
+            if type(key) is int and self._hook_flag_keys is not None:
+                if source.base not in self._hook_membership_sources:
+                    hooks = tx.output.resolve_source_value(source.base)
+                    if not all(type(k) is int for k in dict.keys(hooks)):
+                        return super().sq_contains_impl(tx, item)
+                    if not config.skip_nnmodule_hook_guards:
+                        item.python_type()
+                        for stored_key in self.items:
+                            stored_key.vt.python_type()
+                    if self.GLOBAL_FLAGS:
+                        self.install_dict_keys_match_guard()
+                    install_guard(
+                        source.base.base.make_guard(
+                            functools.partial(
+                                GuardBuilder.NN_MODULE_HOOKS_DICT_CONTAINS,
+                                hooks_name=source.base.member,
+                                flags_source=self.source,
+                            )
+                        )
+                    )
+                    if not TracingContext.get().guards_context.skip_install:
+                        self._hook_membership_sources.add(source.base)
+                return ConstantVariable.create(key in self._hook_flag_keys)
+        if not self.items and isinstance(item, variables.LazyConstantVariable):
+            item.python_type()  # install TYPE_MATCH without specializing the value
+            self.install_dict_keys_match_guard()
+            return ConstantVariable.create(False)
+        return super().sq_contains_impl(tx, item)
+
+
+class NNModuleHookFlagsDictVariable(
+    _NNModuleHookFlagsDictVariable, NNModuleHooksDictVariable
+):
+    pass
+
+
+class NNModuleHookFlagsOrderedDictVariable(
+    NNModuleHookFlagsDictVariable, OrderedDictVariable
+):
+    pass
+
+
+class NNModuleGlobalHooksDictVariable(
+    _NNModuleHookFlagsDictVariable, NNModuleHooksDictVariable
+):
+    # Global IDs may be pinned while local IDs vary across equivalent modules.
+    GLOBAL_FLAGS = True
+
+    def install_dict_keys_match_guard(self) -> None:
+        ConstDictVariable.install_dict_keys_match_guard(self)
+
+
+class NNModuleGlobalHooksOrderedDictVariable(
+    NNModuleGlobalHooksDictVariable, OrderedDictVariable
+):
+    pass
 
 
 class DictViewVariable(VariableTracker):

@@ -257,6 +257,8 @@ from .dicts import (
     ConstDictVariable,
     DictKeysVariable,
     MappingProxyVariable,
+    NNModuleGlobalHooksDictVariable,
+    NNModuleGlobalHooksOrderedDictVariable,
     OrderedDictVariable,
 )
 from .distributed import WorldMetaClassVariable
@@ -1199,7 +1201,22 @@ class VariableBuilder:
             if dup_guard is not None:
                 self.install_guards(dup_guard)
             elif (
-                is_from_attr_proxy_source(self.source)
+                isinstance(result, ConstDictVariable)
+                and any(
+                    isinstance(source, AttrSource)
+                    and source.member
+                    in (
+                        "_backward_hooks",
+                        "_backward_pre_hooks",
+                        "_forward_hooks",
+                        "_forward_pre_hooks",
+                        "_forward_hooks_with_kwargs",
+                        "_forward_pre_hooks_with_kwargs",
+                        "_forward_hooks_always_called",
+                    )
+                    for source in (self.source, result.source)
+                )
+                or is_from_attr_proxy_source(self.source)
                 or isinstance(self.source, MappingProxyMappingSource)
                 or (
                     result.source is not None
@@ -1211,10 +1228,9 @@ class VariableBuilder:
             ):
                 if result.source is None:
                     raise AssertionError("Tracked alias must have a source")
-                # make_dupe_guard cannot relate local and global sources. Reusing
-                # the tracker still requires both sources to resolve to the same
-                # object (a base module, or the mapping behind a mappingproxy), so
-                # pin each source to its compile-time object.
+                # make_dupe_guard cannot relate local and global sources, e.g.
+                # G._forward_hooks is m._forward_hooks. Reusing the tracker still
+                # requires both sources to resolve to that same object, so pin both.
                 install_guard(
                     self.source.make_guard(GuardBuilder.ID_MATCH),
                     result.source.make_guard(GuardBuilder.ID_MATCH),
@@ -1512,7 +1528,19 @@ class VariableBuilder:
             )
             return self.tx.output.side_effects.track_object_existing(value, result)
         elif istype(value, (dict, collections.defaultdict, collections.OrderedDict)):
-            self.install_guards(GuardBuilder.TYPE_MATCH)
+            global_hooks = istype(value, (dict, collections.OrderedDict)) and any(
+                value is getattr(torch.nn.modules.module, name)
+                for name in (
+                    "_global_forward_hooks_with_kwargs",
+                    "_global_forward_hooks_always_called",
+                    "_global_forward_pre_hooks",
+                    "_global_forward_hooks",
+                    "_global_backward_pre_hooks",
+                    "_global_backward_hooks",
+                )
+            )
+            if not (global_hooks and config.skip_nnmodule_hook_guards):
+                self.install_guards(GuardBuilder.TYPE_MATCH)
             all_const = all(ConstantVariable.is_literal(k) for k in value)
 
             # For all_const, we don't have to guard on anything yet. We guard on
@@ -1559,7 +1587,14 @@ class VariableBuilder:
                 build_key_value(i, k, v) for i, k, v in _dict_input_snapshot(value)
             )
 
-            if istype(value, collections.defaultdict):
+            if global_hooks:
+                flags_cls = (
+                    NNModuleGlobalHooksOrderedDictVariable
+                    if istype(value, collections.OrderedDict)
+                    else NNModuleGlobalHooksDictVariable
+                )
+                result = flags_cls(result, source=self.source)
+            elif istype(value, collections.defaultdict):
                 factory_source = AttrSource(self.source, "default_factory")
                 result = DefaultDictVariable(
                     result,  # type: ignore[arg-type]
