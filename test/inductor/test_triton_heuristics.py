@@ -257,11 +257,8 @@ class TestTritonHeuristics(TestCase):
         Make sure block size does not exceed the maximum defined in inductor config.
         """
         cfg = triton_config({"x": 2048, "y": 2}, 64, 64)
-        for label in "XYZ":
-            key = f"{label}BLOCK"
-            if key not in cfg.kwargs:
-                continue
-            self.assertTrue(cfg.kwargs[key] <= TRITON_MAX_BLOCK[label])
+        for key, block in cfg.kwargs.items():
+            self.assertLessEqual(block, TRITON_MAX_BLOCK[key.removesuffix("BLOCK")])
 
     def test_native_matmul_config_block_numel_limit(self):
         device = DeviceProperties(
