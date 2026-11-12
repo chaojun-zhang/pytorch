@@ -766,7 +766,7 @@ class HashableTracker:
 
     @staticmethod
     def iter_keys_by_identity(
-        mapping: dict["HashableTracker", VariableTracker],
+        mapping: Iterable["HashableTracker"],
     ) -> Iterator["HashableTracker"]:
         # OrderedDict iteration compares known stored keys by identity, without callbacks.
         iterator = iter(mapping)
