@@ -2511,6 +2511,16 @@
       ]
     }
   ],
+  "GB4524": [
+    {
+      "Gb_type": "Unsupported OrderedDict snapshot runtime",
+      "Context": "str(error)",
+      "Explanation": "This Python runtime cannot safely snapshot this OrderedDict's linked nodes.",
+      "Hints": [
+        "Use a supported Python version; free-threaded nonempty snapshots require Python 3.14.1+."
+      ]
+    }
+  ],
   "GB0144": [
     {
       "Gb_type": "Unsupported custom jvp",
@@ -7140,6 +7150,25 @@
     }
   ],
   "GB8811": [
+    {
+      "Gb_type": "OrderedDict storage differs from linked keys",
+      "Context": "OrderedDict input snapshot: {error}",
+      "Explanation": "Dynamo cannot safely match this OrderedDict's linked order to its dictionary storage.",
+      "Hints": [
+        "Use OrderedDict methods instead of raw dict writes such as dict.__setitem__(mapping, key, value).",
+        "This graph break is fundamental - it is unlikely that Dynamo will ever be able to trace through your code. Consider finding a workaround."
+      ]
+    },
+    {
+      "Gb_type": "OrderedDict storage differs from linked keys",
+      "Context": "OrderedDict input snapshot: {error}",
+      "Explanation": "Dynamo cannot safely match this OrderedDict's linked order to its dictionary storage.",
+      "Hints": [
+        "Use OrderedDict methods instead of raw dict writes such as dict.__setitem__(mapping, key, value).",
+        "On free-threaded builds, use Python 3.14.1 or newer.",
+        "This graph break is fundamental - it is unlikely that Dynamo will ever be able to trace through your code. Consider finding a workaround."
+      ]
+    },
     {
       "Gb_type": "OrderedDict storage differs from linked keys",
       "Context": "OrderedDict input snapshot",

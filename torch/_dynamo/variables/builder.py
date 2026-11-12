@@ -214,6 +214,7 @@ from ..utils import (
     tuple_iterator,
     tuple_iterator_getitem,
     tuple_iterator_len,
+    UnsupportedOrderedDictRuntime,
     unwrap_with_attr_name_if_wrapper,
     wrap_fake_exception,
 )
@@ -939,15 +940,28 @@ def _is_dim_dynamic_from_source_dynamism(
 def _dict_input_snapshot(value: dict[Any, Any]) -> list[tuple[int, Any, Any]]:
     try:
         return list(enumerate_items_with_dict_position(value))
-    except InvalidOrderedDict:
+    except UnsupportedOrderedDictRuntime as error:
+        unimplemented(
+            gb_type="Unsupported OrderedDict snapshot runtime",
+            context=str(error),
+            explanation="This Python runtime cannot safely snapshot this OrderedDict's linked nodes.",
+            hints=[
+                "Use a supported Python version; free-threaded nonempty snapshots require Python 3.14.1+.",
+            ],
+            from_exc=error,
+            skip_frame=True,
+            apply_to_code=False,
+        )
+    except InvalidOrderedDict as error:
         unimplemented(
             gb_type="OrderedDict storage differs from linked keys",
-            context="OrderedDict input snapshot",
-            explanation="Raw dict writes can leave storage entries without matching OrderedDict links; Dynamo cannot track their iteration order.",
+            context=f"OrderedDict input snapshot: {error}",
+            explanation="Dynamo cannot safely match this OrderedDict's linked order to its dictionary storage.",
             hints=[
                 "Use OrderedDict methods instead of raw dict writes such as dict.__setitem__(mapping, key, value).",
                 *graph_break_hints.FUNDAMENTAL,
             ],
+            from_exc=error,
             skip_frame=True,
             apply_to_code=False,
         )

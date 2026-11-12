@@ -28,6 +28,7 @@ from torch._C._dynamo import (
     PySequenceSlots,
     PyTypeSlots,
 )
+from torch._guards import TracingContext
 
 from .. import config, graph_break_hints, polyfills, variables
 from ..exc import (
@@ -188,6 +189,14 @@ def type_implements_mp_slot(obj_type: type, slot: int) -> bool:
 
 # Flag Include/object.h
 Py_TPFLAGS_DISALLOW_INSTANTIATION = 1 << 7
+Py_TPFLAGS_IMMUTABLETYPE = 1 << 8
+
+
+def type_is_immutable(obj_type: type, /) -> bool:
+    return bool(
+        type.__dict__["__flags__"].__get__(obj_type, type(obj_type))
+        & Py_TPFLAGS_IMMUTABLETYPE
+    )
 
 
 def type_disallows_instantiation(obj_type: type) -> bool:
@@ -2298,7 +2307,28 @@ def mro_attr_source(
     Guards absence in every skipped class, including a complete MRO miss.
     Returns None on a complete miss; callers decide whether that is an error.
     """
-    for idx, (base, namespace) in enumerate(iter_mro_static_dicts(klass)):
+    entries = tuple(iter_mro_static_dicts(klass))
+    memoize = (
+        not TracingContext.get().guards_context.skip_install
+        and not is_from_skip_guard_source(klass_source)
+    )
+    if (
+        memoize
+        and not type_is_immutable(klass)
+        and id(klass) not in tx.output.guarded_mro_type_ids
+    ):
+        # TYPE_MATCH pins the class, not its bases. Cached owner sources require both.
+        mro_source = TypeMROSource(klass_source)
+        install_guard(mro_source.make_guard(GuardBuilder.SEQUENCE_LENGTH))
+        # The builtin metaclass always puts the already guarded class first.
+        first = 1 if type(klass) is type else 0
+        # A custom ancestor MRO can replace even an object tail at constant length.
+        for index in range(first, len(entries)):
+            install_guard(
+                GetItemSource(mro_source, index).make_guard(GuardBuilder.ID_MATCH)
+            )
+        tx.output.guarded_mro_type_ids.add(id(klass))
+    for idx, (base, namespace) in enumerate(entries):
         if not is_constant_source(klass_source):
             direct = not idx and base is klass
             attr = None
@@ -2327,14 +2357,15 @@ def mro_attr_source(
         # the descriptor: a descriptor shared by unrelated classes needs a
         # source through each one.
         cache_key = (id(base), name)
-        cached = tx.output.mro_source_cache.get(cache_key)
+        cached = tx.output.mro_source_cache.get(cache_key) if memoize else None
         if cached is not None:
             return cached
 
         source = DictGetItemSource(
             TypeDictSource(_mro_entry_source(klass, klass_source, idx)), name
         )
-        tx.output.mro_source_cache[cache_key] = source
+        if memoize:
+            tx.output.mro_source_cache[cache_key] = source
         return source
 
     guard_mro_absent(

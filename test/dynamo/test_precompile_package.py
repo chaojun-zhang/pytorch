@@ -43,10 +43,13 @@ from torch._dynamo.source import (
     GetItemSource,
     GlobalSource,
     LocalSource,
+    TypeMROSource,
     TypeSource,
 )
 from torch._dynamo.types import GuardFilterEntry
 from torch._guards import ChainedSource, Guard
+from torch._precompile import PrecompileError
+from torch.compiler.precompile import capture
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
@@ -277,7 +280,77 @@ _RISKY_DROP_CASES = {
 }  # fmt: skip
 
 
+class _MROBase:
+    scale = 1
+
+
+class _MROOther:
+    scale = 7
+
+
+class _MROLeft(_MROBase):
+    pass
+
+
+class _MRORight(_MROBase):
+    pass
+
+
+class _DynamicMROInput(type("_DynamicMROBase", (), {"scale": 1})):
+    pass
+
+
+def _mro_sum(x, left, right):
+    return x + left.scale + right.scale
+
+
 class TestPrecompilePackage(torch._inductor.test_case.TestCase):
+    def test_mro_guard_survives_serialization(self):
+        x, left, right = torch.ones(1), _MROLeft(), _MRORight()
+        compiled = _aot_compile(_mro_sum, x, left, right)
+        data = AOTCompiledFunction.serialize(compiled).serialized_data
+        loaded = AOTCompiledFunction.deserialize(data, guard_globals=globals())
+        self.assertTrue(loaded.guard_check(x, left, right))
+        self.assertEqual(loaded(x, left, right), x + 2)
+        try:
+            _MRORight.__bases__ = (_MROOther,)
+            self.assertFalse(loaded.guard_check(x, left, right))
+        finally:
+            _MRORight.__bases__ = (_MROBase,)
+
+    def test_mro_guard_refuses_nonreferenceable_base(self):
+        # Retained identity guards must fail loudly; dropping them opts out of protection.
+        x, obj = torch.ones(1), _DynamicMROInput()
+        with self.assertRaisesRegex(
+            PackageError, "ID_MATCH guard cannot be serialized"
+        ):
+            _aot_compile(
+                _mro_sum,
+                x,
+                obj,
+                obj,
+                guard_filter_fn=lambda entries: [True] * len(entries),
+            )
+
+    def test_default_precompile_refuses_nonreferenceable_base(self):
+        # The default filter must not silently discard a mutable base's identity.
+        x, obj = torch.ones(1), _DynamicMROInput()
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = os.path.join(directory, "mro.py")
+            cache = os.path.join(directory, "mro.cache")
+            with self.assertRaisesRegex(
+                PrecompileError, "dropped guard.*__mro__.*MRO bases.*importable"
+            ):
+                with capture(
+                    _mro_sum,
+                    artifact_path=artifact,
+                    cache_path=cache,
+                    backend="eager",
+                ) as compiled:
+                    self.assertEqual(compiled(x, obj, obj), x + 2)
+            self.assertFalse(os.path.exists(artifact))
+            self.assertFalse(os.path.exists(cache))
+
     @parametrize("caching_precompile", (False, True))
     @parametrize("descriptor_kind", ("method", "classmethod"))
     def test_raw_descriptor_guard_survives_serialization(
@@ -586,7 +659,14 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
                 t = type(e.value)
                 return e.guard_type == "TYPE_MATCH" and t.__qualname__ != t.__name__
 
-            return [not local_type_match(e) and _pre_check_accepts(e) for e in entries]
+            # The control must also drop the MRO length: local nn.Module instances
+            # load as base Module objects, so that snapshot otherwise rejects both types.
+            return [
+                not local_type_match(e)
+                and not isinstance(e.orig_guard.originating_source, TypeMROSource)
+                and _pre_check_accepts(e)
+                for e in entries
+            ]
 
         # Not assertRaises: it stores the exception with its traceback cleared.
         # Both paths raise through guards.py's raise_local_type_error with one
